@@ -93,14 +93,15 @@ def sync_time(log):
 def check_cameras(log, tree):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Offline Cameras - {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    ws.title = f"Offline Cameras {datetime.now().strftime('%Y-%m-%d %H.%M.%S')}"
     ws.append(["NVR IP", "Camera IP", "Status", "Checked At"])
 
     options = Options()
     options.add_argument("--start-maximized")
 
     for ip in NVR_LIST:
-        if stop_requested: break
+        if stop_requested: 
+            break
         log.insert(tk.END, f"\n🔁 Starting camera check for {ip}\n")
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         wait = WebDriverWait(driver, 20)
@@ -111,29 +112,130 @@ def check_cameras(log, tree):
             wait.until(EC.presence_of_element_located((By.ID, "password"))).send_keys(PASSWORD + Keys.RETURN)
             log.insert(tk.END, "✅ Logged in\n")
             time.sleep(10)
+            
+            # Click Configuration
             wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Configuration')]"))).click()
+            log.insert(tk.END, "✅ Clicked Configuration\n")
             time.sleep(10)
-            wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="menu"]/div/div[2]/div[5]'))).click()
+            
+            # Click Camera Settings - Try multiple possible selectors
+            try:
+                # First try the original selector
+                wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="menu"]/div/div[2]/div[5]'))).click()
+                log.insert(tk.END, "✅ Clicked Camera Settings (original selector)\n")
+            except:
+                try:
+                    # Try alternative selector - click on text "Camera Settings"
+                    wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(text(),'Camera Settings')]"))).click()
+                    log.insert(tk.END, "✅ Clicked Camera Settings (text selector)\n")
+                except:
+                    try:
+                        # Try another alternative - click on any element with camera settings
+                        wait.until(EC.element_to_be_clickable((By.XPATH, "//*[contains(text(),'Camera') and contains(text(),'Settings')]"))).click()
+                        log.insert(tk.END, "✅ Clicked Camera Settings (general selector)\n")
+                    except Exception as e:
+                        log.insert(tk.END, f"❌ Could not find Camera Settings: {e}\n")
+                        driver.quit()
+                        continue
+            
             time.sleep(5)
-            rows = wait.until(EC.presence_of_element_located((By.XPATH, '//*[@id="tableDigitalChannels"]/div/div[2]'))).find_elements(By.XPATH, "./div")
-
-            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            for row in rows:
-                spans = row.find_elements(By.TAG_NAME, "span")
-                if len(spans) >= 7:
-                    ip_addr = spans[2].text.strip()
-                    status = spans[6].text.strip().lower()
-                    if "offline" in status or "abnormal" in status:
-                        ws.append([ip, ip_addr, status, checked_at])
-                        tree.insert("", tk.END, values=(ip_addr, status))
-            log.insert(tk.END, f"✅ Camera check done for {ip}\n")
+            
+            # Wait for camera table to load and get camera rows
+            try:
+                # Wait for the table to be present
+                table_container = wait.until(EC.presence_of_element_located((By.ID, "tableDigitalChannels")))
+                log.insert(tk.END, "✅ Found camera table\n")
+                
+                # Find all camera rows - try multiple selectors
+                rows = []
+                try:
+                    rows = table_container.find_elements(By.XPATH, ".//div[contains(@class, 'row')]")
+                except:
+                    try:
+                        rows = driver.find_elements(By.XPATH, "//div[contains(@id, 'channel') or contains(@class, 'channel')]")
+                    except:
+                        rows = driver.find_elements(By.CLASS_NAME, "digital-channel-item")
+                
+                log.insert(tk.END, f"✅ Found {len(rows)} camera rows\n")
+                
+                if len(rows) == 0:
+                    # Try to find cameras using a more generic approach
+                    all_divs = driver.find_elements(By.TAG_NAME, "div")
+                    camera_divs = []
+                    for div in all_divs:
+                        text = div.text.lower()
+                        if any(word in text for word in ["camera", "channel", "ip camera", "ipc"]):
+                            if "192.168" in text or "camera" in text:
+                                camera_divs.append(div)
+                    rows = camera_divs
+                    log.insert(tk.END, f"✅ Found {len(rows)} camera elements (alternative method)\n")
+                
+                checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cameras_found = 0
+                offline_cameras = 0
+                
+                for i, row in enumerate(rows[:50]):  # Limit to 50 cameras to avoid infinite loops
+                    try:
+                        row_html = row.get_attribute('outerHTML')
+                        row_text = row.text
+                        
+                        # Extract camera name/IP - look for patterns
+                        camera_ip = f"Camera {i+1}"
+                        status = "Unknown"
+                        
+                        # Look for IP address pattern
+                        import re
+                        ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+                        ip_matches = re.findall(ip_pattern, row_text)
+                        if ip_matches:
+                            camera_ip = ip_matches[0]
+                        
+                        # Look for status indicators
+                        status_lower = row_text.lower()
+                        if "offline" in status_lower or "disconnect" in status_lower:
+                            status = "Offline"
+                            offline_cameras += 1
+                        elif "online" in status_lower or "normal" in status_lower:
+                            status = "Online"
+                        elif "abnormal" in status_lower:
+                            status = "Abnormal"
+                            offline_cameras += 1
+                        
+                        # If we found an offline camera, add to report
+                        if status in ["Offline", "Abnormal"]:
+                            ws.append([ip, camera_ip, status, checked_at])
+                            tree.insert("", tk.END, values=(camera_ip, status))
+                            log.insert(tk.END, f"⚠️ Found offline camera: {camera_ip} - {status}\n")
+                        
+                        cameras_found += 1
+                        
+                    except Exception as e:
+                        log.insert(tk.END, f"❌ Error processing camera row: {e}\n")
+                        continue
+                
+                log.insert(tk.END, f"✅ Processed {cameras_found} cameras, {offline_cameras} offline\n")
+                
+            except Exception as e:
+                log.insert(tk.END, f"❌ Error finding camera table: {e}\n")
+                # Take screenshot for debugging
+                try:
+                    screenshot_path = os.path.join(DOWNLOADS_DIR, f"debug_{ip.replace('://', '_').replace('/', '')}.png")
+                    driver.save_screenshot(screenshot_path)
+                    log.insert(tk.END, f"📷 Screenshot saved to: {screenshot_path}\n")
+                except:
+                    pass
+            
         except Exception as e:
-            log.insert(tk.END, f"❌ Error for {ip}: {e}\n")
+            log.insert(tk.END, f"❌ General error for {ip}: {e}\n")
         finally:
             driver.quit()
 
     wb.save(EXCEL_FILE)
     log.insert(tk.END, f"\n📄 Report saved to: {EXCEL_FILE}\n")
+
+
+
+
 
 # --- GUI ---
 def start_all(log, btn, tree, status_label):
@@ -152,21 +254,36 @@ def start_all(log, btn, tree, status_label):
     tree.delete(*tree.get_children())
 
     def task():
+        # Run time sync first
         sync_time(log)
-        if not stop_requested:
-            check_cameras(log, tree)
-            log.insert(tk.END, "\n🎉 All tasks completed.\n")
-            status_label.config(text="Status: Completed", fg="#27ae60")
-        else:
-            log.insert(tk.END, "\n⛔ Task stopped by user.\n")
+        
+        # Check if stop was requested during time sync
+        if stop_requested:
+            log.insert(tk.END, "\n⛔ Task stopped by user after time sync.\n")
             status_label.config(text="Status: Stopped", fg="#e74c3c")
+        else:
+            # Run camera check only if not stopped
+            log.insert(tk.END, "\n" + "="*50 + "\n")
+            log.insert(tk.END, "Starting Camera Status Check...\n")
+            log.insert(tk.END, "="*50 + "\n")
+            
+            check_cameras(log, tree)
+            
+            if not stop_requested:
+                log.insert(tk.END, "\n🎉 All tasks completed.\n")
+                status_label.config(text="Status: Completed", fg="#27ae60")
+            else:
+                log.insert(tk.END, "\n⛔ Camera check stopped by user.\n")
+                status_label.config(text="Status: Stopped", fg="#e74c3c")
 
+        # Reset button
         btn.config(state=tk.NORMAL, text="Start Sync & Camera Check", bg="#2980b9")
+        
+        # Reset status if not stopped
         if not stop_requested:
             status_label.config(text="Status: Ready", fg="#7f8c8d")
 
     threading.Thread(target=task, daemon=True).start()
-
 # Update layout on window resize
 def update_layout(event=None):
     width = root.winfo_width()
