@@ -1,0 +1,20 @@
+{
+    "NVR_LIST": [
+        "http://192.168.110.12/",
+        "http://192.168.100.11/",
+        "http://192.168.100.12/",
+        "http://192.168.100.13/",
+        "http://192.168.100.14/",
+        "http://192.168.100.15/",
+        "http://192.168.100.16/",
+        "http://192.168.100.17/",
+        "http://192.168.100.18/",
+        "http://192.168.100.19/",
+        "http://192.168.100.21/"
+    ],
+    "USERNAME": "admin",
+    "PASSWORD": "Javaid786",
+    "DOWNLOADS_DIR": "C:\\Users\\IT-PC\\Downloads",
+    "EXCEL_FILE": "OfflineCameras.xlsx",
+    "QODIGI_URL": "https://qodigi.netlify.app"
+}

@@ -14,7 +14,7 @@ PyInstaller.__main__.run([
     '--onefile',
     '--windowed',
     '--icon=images/logo.ico',
-    '--name=NVR_SyncGuard',  # Changed to underscore (no spaces is better)
+    '--name=NVR_SKP SyncGuard',  # Changed to underscore (no spaces is better)
     '--add-data=images/logo.png{}images'.format(separator),
     '--add-data=images/logo.ico{}images'.format(separator),
     '--hidden-import=openpyxl',
