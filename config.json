@@ -1,20 +1,18 @@
 {
     "NVR_LIST": [
-        "http://192.168.110.12/",
-        "http://192.168.100.11/",
-        "http://192.168.100.12/",
-        "http://192.168.100.13/",
-        "http://192.168.100.14/",
-        "http://192.168.100.15/",
-        "http://192.168.100.16/",
-        "http://192.168.100.17/",
-        "http://192.168.100.18/",
-        "http://192.168.100.19/",
-        "http://192.168.100.21/"
+        {
+            "url": "http://192.168.100.22/",
+            "username": "admin",
+            "password": "Javaid786"
+        }
     ],
-    "USERNAME": "admin",
-    "PASSWORD": "Javaid786",
     "DOWNLOADS_DIR": "C:\\Users\\IT-PC\\Downloads",
     "EXCEL_FILE": "OfflineCameras.xlsx",
-    "QODIGI_URL": "https://qodigi.netlify.app"
+    "QODIGI_URL": "https://codraze.vercel.app",
+    "AUTO_START": false,
+    "SCAN_DELAY_SECONDS": 2,
+    "ADMIN_PASSWORD_SET_AT": "2026-09-23",
+    "COLLECT_ALL_IPS": false,
+    "ADMIN_PASSWORD_HASH": "cb7970b70bf35bdb224ac9edbd9ff92e4b801c0e99e3e070415f6766529a2e9a",
+    "ADMIN_PASSWORD_SALT": "8965e0d03d2768e5b51f80655ae3e488"
 }
