@@ -6,13 +6,28 @@
             "password": "Javaid786"
         }
     ],
-    "DOWNLOADS_DIR": "C:\\Users\\IT-PC\\Downloads",
+    "DOWNLOADS_DIR": "C:\\Users\\IT-PC\\Downloads\\Offline Camera",
     "EXCEL_FILE": "OfflineCameras.xlsx",
-    "QODIGI_URL": "https://codraze.vercel.app",
+    "CODRAZE_URL": "https://codraze.vercel.app/",
     "AUTO_START": false,
     "SCAN_DELAY_SECONDS": 2,
-    "ADMIN_PASSWORD_SET_AT": "2026-09-23",
     "COLLECT_ALL_IPS": false,
     "ADMIN_PASSWORD_HASH": "cb7970b70bf35bdb224ac9edbd9ff92e4b801c0e99e3e070415f6766529a2e9a",
-    "ADMIN_PASSWORD_SALT": "8965e0d03d2768e5b51f80655ae3e488"
+    "ADMIN_PASSWORD_SALT": "8965e0d03d2768e5b51f80655ae3e488",
+    "ADMIN_PASSWORD_SET_AT": "2026-09-23",
+    "AUTO_CLOSE_HOUR": 12,
+    "AUTO_CLOSE_MINUTE": 0,
+    "AUTO_CLOSE_ENABLED": true,
+    "TIMEOUT_LOGIN": 120,
+    "TIMEOUT_DASHBOARD": 120,
+    "TIMEOUT_CONFIG_CLICK": 60,
+    "TIMEOUT_TIME_MENU": 60,
+    "TIMEOUT_TIME_FORM": 60,
+    "TIMEOUT_SAVE_CONFIRM": 30,
+    "TIMEOUT_CAMERA_MENU": 90,
+    "TIMEOUT_CAMERA_TABLE": 180,
+    "TIMEOUT_BETWEEN_NVR": 5,
+    "STABILITY_BUFFER": 2.0,
+    "USE_DATE_STAMPED_FILES": true,
+    "QODIGI_URL": "https://codraze.vercel.app"
 }
