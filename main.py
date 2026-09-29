@@ -1,7 +1,25 @@
 """
-NVR SyncGuard - Automated Time Synchronization & Camera Monitoring
+NVR SyncGuard v4.3.1
+Automated NVR Time Synchronization & Camera Health Monitoring
 Developed by Codraze
-Version: 3.4.0 (overlay-safe clicking + compact settings + smart timeouts)
+
+v4.3.1 CHANGES:
+  - UI reflects background running state (button shows RUNNING).
+  - Exit and Restart buttons in the action bar.
+  - X only hides the window; app keeps running in tray.
+  - Collapsible left panel via hamburger menu button.
+  - 6 stat cards in two rows: NVR stats + Camera stats.
+  - Separate Ping Monitor panel alongside Activity log.
+  - Camera-ping and NVR-ping events stream into the ping panel.
+
+Preserved from prior versions:
+  - Single Chrome session reused across all NVRs per run.
+  - Per-NVR login; time sync + camera scan in one session.
+  - NVR retry with increasing waits before skipping.
+  - Robust click strategies (native → JS → synthetic events).
+  - Excel report on every run.
+  - Admin password protection.
+  - Autostart with Windows.
 """
 
 import tkinter as tk
@@ -33,6 +51,7 @@ import threading
 import os
 import time
 import sys
+import socket
 import webbrowser
 import re
 import json
@@ -40,10 +59,14 @@ import subprocess
 import winreg
 import shutil
 import tempfile
-import importlib
 import hashlib
 import hmac
 import secrets
+import uuid
+import logging
+import queue
+from collections import Counter
+from logging.handlers import RotatingFileHandler
 
 try:
     import selenium.webdriver.chrome.webdriver
@@ -55,13 +78,13 @@ except ImportError:
 # APP METADATA
 # =========================================================
 APP_NAME = "NVR SyncGuard"
-APP_VERSION = "3.4.0"
+APP_VERSION = "4.3.1"
 APP_AUTHOR = "Codraze"
 APP_YEAR = datetime.now().year
 
 
 # =========================================================
-# CONFIG
+# CONFIG / PATHS
 # =========================================================
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -74,6 +97,8 @@ else:
     ICO_PATH = os.path.join(BASE_DIR, "images", "logo.ico")
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 DEFAULT_ADMIN_PASSWORD = "Saad@18977"
 
@@ -103,11 +128,31 @@ DEFAULT_CONFIG = {
     "TIMEOUT_SAVE_CONFIRM": 30,
     "TIMEOUT_CAMERA_MENU": 90,
     "TIMEOUT_CAMERA_TABLE": 180,
-    "TIMEOUT_BETWEEN_NVR": 5,
-    "STABILITY_BUFFER": 2,
+    "TIMEOUT_BETWEEN_NVR": 3,
+    "STABILITY_BUFFER": 1.5,
     "USE_DATE_STAMPED_FILES": True,
     "OVERLAY_WAIT_TIMEOUT": 8,
     "CLICK_MAX_ATTEMPTS": 3,
+    "BACKGROUND_MODE": True,
+    "START_MINIMIZED_TO_TRAY": True,
+    "MONITOR_INTERVAL_MINUTES": 5,
+    "SHOW_TOASTS": True,
+    "AUTOSTART_WITH_WINDOWS": True,
+    "NVR_DOWN_RETRY_BASE_SECONDS": 30,
+    "NVR_DOWN_RETRY_MAX_SECONDS": 300,
+    "RUN_SCAN_ON_LAUNCH": True,
+    "BACKGROUND_PING_MONITOR": True,
+    "AUTO_SCAN_ON_RECOVERY": True,
+    "NVR_RETRY_ATTEMPTS": 3,
+    "NVR_RETRY_WAIT_SECONDS": [30, 60, 90],
+    "ELEMENT_READY_TIMEOUT": 20,
+    "PAGE_READY_TIMEOUT": 15,
+    # ---- v4.3.0 additions ----
+    "MONITOR_INTERVAL_SECONDS": 30,
+    "CAMERA_PING_ENABLED": True,
+    "CAMERA_PING_INTERVAL_SECONDS": 15,
+    "CAMERA_PING_TIMEOUT_SECONDS": 3,
+    "CAMERA_PING_METHOD": "tcp",     # "tcp" or "icmp"
 }
 
 
@@ -135,6 +180,48 @@ def load_config():
 
 
 config = load_config()
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+def _setup_logging():
+    log_file = os.path.join(
+        LOG_DIR, f"syncguard_{datetime.now().strftime('%Y-%m-%d')}.log"
+    )
+    logger = logging.getLogger("syncguard")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    fh = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=7,
+                             encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    try:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    except Exception:
+        pass
+
+    return logger
+
+
+LOGGER = _setup_logging()
+
+
+def log_line(text):
+    try:
+        LOGGER.info(str(text).rstrip("\n"))
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -354,7 +441,9 @@ def _open_change_password_dialog(parent=None):
 _load_admin_state_from_config()
 
 
-# --- NVR list normalization ---
+# =========================================================
+# NVR LIST NORMALIZATION
+# =========================================================
 def _normalize_nvr_entry(entry, default_user="admin"):
     if isinstance(entry, dict):
         url = str(entry.get("url", "")).strip()
@@ -397,16 +486,50 @@ TIMEOUT_TIME_FORM = int(config.get("TIMEOUT_TIME_FORM", 60))
 TIMEOUT_SAVE_CONFIRM = int(config.get("TIMEOUT_SAVE_CONFIRM", 30))
 TIMEOUT_CAMERA_MENU = int(config.get("TIMEOUT_CAMERA_MENU", 90))
 TIMEOUT_CAMERA_TABLE = int(config.get("TIMEOUT_CAMERA_TABLE", 180))
-TIMEOUT_BETWEEN_NVR = int(config.get("TIMEOUT_BETWEEN_NVR", 5))
-STABILITY_BUFFER = float(config.get("STABILITY_BUFFER", 2))
-
+TIMEOUT_BETWEEN_NVR = int(config.get("TIMEOUT_BETWEEN_NVR", 3))
+STABILITY_BUFFER = float(config.get("STABILITY_BUFFER", 1.5))
 USE_DATE_STAMPED_FILES = bool(config.get("USE_DATE_STAMPED_FILES", True))
-
 OVERLAY_WAIT_TIMEOUT = float(config.get("OVERLAY_WAIT_TIMEOUT", 8))
 CLICK_MAX_ATTEMPTS = int(config.get("CLICK_MAX_ATTEMPTS", 3))
 
-# ---- Global UI vars (assigned inside main()) ----
+NVR_RETRY_ATTEMPTS = int(config.get("NVR_RETRY_ATTEMPTS", 3))
+NVR_RETRY_WAIT_SECONDS = config.get("NVR_RETRY_WAIT_SECONDS", [30, 60, 90])
+if not isinstance(NVR_RETRY_WAIT_SECONDS, list) or not NVR_RETRY_WAIT_SECONDS:
+    NVR_RETRY_WAIT_SECONDS = [30, 60, 90]
+try:
+    NVR_RETRY_WAIT_SECONDS = [int(x) for x in NVR_RETRY_WAIT_SECONDS]
+except Exception:
+    NVR_RETRY_WAIT_SECONDS = [30, 60, 90]
+ELEMENT_READY_TIMEOUT = int(config.get("ELEMENT_READY_TIMEOUT", 20))
+PAGE_READY_TIMEOUT = int(config.get("PAGE_READY_TIMEOUT", 15))
+
+BACKGROUND_MODE = bool(config.get("BACKGROUND_MODE", True))
+START_MINIMIZED_TO_TRAY = bool(config.get("START_MINIMIZED_TO_TRAY", True))
+MONITOR_INTERVAL_MINUTES = int(config.get("MONITOR_INTERVAL_MINUTES", 5))
+SHOW_TOASTS = bool(config.get("SHOW_TOASTS", True))
+AUTOSTART_WITH_WINDOWS = bool(config.get("AUTOSTART_WITH_WINDOWS", True))
+NVR_DOWN_RETRY_BASE_SECONDS = int(config.get("NVR_DOWN_RETRY_BASE_SECONDS", 30))
+NVR_DOWN_RETRY_MAX_SECONDS = int(config.get("NVR_DOWN_RETRY_MAX_SECONDS", 300))
+
+RUN_SCAN_ON_LAUNCH = bool(config.get("RUN_SCAN_ON_LAUNCH", True))
+BACKGROUND_PING_MONITOR = bool(config.get("BACKGROUND_PING_MONITOR", True))
+AUTO_SCAN_ON_RECOVERY = bool(config.get("AUTO_SCAN_ON_RECOVERY", True))
+
+# v4.3.0 additions
+MONITOR_INTERVAL_SECONDS = int(config.get("MONITOR_INTERVAL_SECONDS", 30))
+CAMERA_PING_ENABLED = bool(config.get("CAMERA_PING_ENABLED", True))
+CAMERA_PING_INTERVAL_SECONDS = int(config.get("CAMERA_PING_INTERVAL_SECONDS", 15))
+CAMERA_PING_TIMEOUT_SECONDS = int(config.get("CAMERA_PING_TIMEOUT_SECONDS", 3))
+CAMERA_PING_METHOD = str(config.get("CAMERA_PING_METHOD", "tcp")).lower()
+if CAMERA_PING_METHOD not in ("tcp", "icmp"):
+    CAMERA_PING_METHOD = "tcp"
+
+# ---- Global UI vars ----
 date_stamp_var = None
+run_scan_on_launch_var = None
+bg_ping_var = None
+auto_recovery_var = None
+ping_interval_var = None
 
 stop_requested = False
 total_nvrs_count = 0
@@ -418,19 +541,538 @@ offline_cameras_data = []
 last_saved_file = None
 scan_running = False
 
+NVR_STATE = {}
+MONITOR_STOP = threading.Event()
+TRAY_ICON = None
+_background_scan_flag = [False]
+
+# Camera-offline tracking
+OFFLINE_CAMERA_IPS = {}   # ip -> {"since": datetime, "last_check": datetime, "nvr": host, "name": str}
+OFFLINE_CAMERA_LOCK = threading.Lock()
+
+# ---- v4.3.1 UI / monitor state ----
+CHECKED_NVRS = 0
+SKIPPED_NVRS = 0
+PING_LOG_LINES = []           # in-memory ring for ping panel
+PING_LOG_MAX = 500
+NVR_PING_HISTORY = {}         # nvr_host -> {"last": datetime, "state": "up"/"down", "latency_ms": int|None}
+CAMERA_PING_HISTORY = {}      # cam_ip -> {"last": datetime, "state": "up"/"down"}
+UI_STATE = {"running": False, "phase": "idle"}   # phase: idle | scanning | monitoring
+UI_QUEUE = queue.Queue()      # main-thread UI updates from workers
+
 
 # =========================================================
-# FILE NAMING HELPERS
+# REDACTION
+# =========================================================
+_PWD_KEYS = re.compile(r'(?i)(pass(word)?|pwd)\s*[:=]\s*("[^"]*"|\'[^\']*\'|\S+)')
+
+
+def redact(text):
+    if text is None:
+        return ""
+    try:
+        return _PWD_KEYS.sub(r'\1: <redacted>', str(text))
+    except Exception:
+        return ""
+
+
+# =========================================================
+# PING LOG (feeds the Ping Monitor panel)
+# =========================================================
+def ping_log(text):
+    """Write to the ping monitor panel (thread-safe)."""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} {text}"
+        PING_LOG_LINES.append(line)
+        if len(PING_LOG_LINES) > PING_LOG_MAX:
+            del PING_LOG_LINES[:len(PING_LOG_LINES) - PING_LOG_MAX]
+        UI_QUEUE.put(("ping_log", line))
+    except Exception:
+        pass
+
+
+# =========================================================
+# TOAST NOTIFICATIONS
+# =========================================================
+def _toast_winotify(title, message):
+    try:
+        from winotify import Notification
+        toast = Notification(
+            app_id="NVR SyncGuard",
+            title=title,
+            msg=message,
+            duration="short",
+        )
+        toast.show()
+        return True
+    except Exception as e:
+        log_line(f"[WARN] winotify failed: {e}")
+        return False
+
+
+def _toast_win10toast(title, message):
+    try:
+        from win10toast import ToastNotifier
+        ToastNotifier().show_toast(
+            title, message, duration=6, threaded=True,
+        )
+        return True
+    except Exception as e:
+        log_line(f"[WARN] win10toast failed: {e}")
+        return False
+
+
+def _toast_tk_fallback(title, message):
+    try:
+        def _show():
+            try:
+                popup = tk.Toplevel()
+                popup.title("NVR SyncGuard")
+                popup.configure(bg="#0b1220")
+                popup.attributes("-topmost", True)
+                popup.geometry("420x140+{}+{}".format(
+                    popup.winfo_screenwidth() - 440,
+                    popup.winfo_screenheight() - 200,
+                ))
+                tk.Label(popup, text=title, bg="#0b1220", fg="#ffffff",
+                         font=("Segoe UI", 12, "bold")).pack(pady=(14, 4))
+                tk.Label(popup, text=message, bg="#0b1220", fg="#cbd5e1",
+                         font=("Segoe UI", 10), wraplength=380,
+                         justify="center").pack(pady=(0, 14))
+                popup.after(7000, popup.destroy)
+            except Exception:
+                pass
+
+        if 'root' in globals() and root:
+            root.after(0, _show)
+        return True
+    except Exception as e:
+        log_line(f"[WARN] Tk toast fallback failed: {e}")
+        return False
+
+
+def show_toast(title, message):
+    if not SHOW_TOASTS:
+        return
+    log_line(f"[TOAST] {title} — {message}")
+    if _toast_winotify(title, message):
+        return
+    if _toast_win10toast(title, message):
+        return
+    _toast_tk_fallback(title, message)
+
+
+# =========================================================
+# WINDOWS STARTUP REGISTRATION
+# =========================================================
+_AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = "NVR_SyncGuard"
+
+
+def _get_launch_command():
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}" --background'
+    py = sys.executable
+    pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+    runner = pyw if os.path.exists(pyw) else py
+    script = os.path.abspath(__file__)
+    return f'"{runner}" "{script}" --background'
+
+
+def register_autostart():
+    try:
+        cmd = _get_launch_command()
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH,
+                             0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+        winreg.CloseKey(key)
+        log_line(f"[AUTOSTART] Registered: {cmd}")
+        return True
+    except Exception as e:
+        log_line(f"[AUTOSTART] Register failed: {e}")
+        return False
+
+
+def unregister_autostart():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH,
+                             0, winreg.KEY_SET_VALUE)
+        try:
+            winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+            log_line("[AUTOSTART] Unregistered")
+        except FileNotFoundError:
+            pass
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        log_line(f"[AUTOSTART] Unregister failed: {e}")
+        return False
+
+
+def is_autostart_registered():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH,
+                             0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, _AUTOSTART_VALUE_NAME)
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+            return False
+    except Exception:
+        return False
+
+
+# =========================================================
+# SYSTEM TRAY
+# =========================================================
+def _load_tray_image():
+    try:
+        from PIL import Image
+        for path in (ICO_PATH, LOGO_PATH):
+            if path and os.path.exists(path):
+                img = Image.open(path).convert("RGBA")
+                img = img.resize((64, 64), Image.LANCZOS)
+                return img
+    except Exception as e:
+        log_line(f"[TRAY] Image load failed: {e}")
+    try:
+        from PIL import Image
+        return Image.new("RGBA", (64, 64), (37, 99, 235, 255))
+    except Exception:
+        return None
+
+
+def _build_tray_tooltip():
+    base = f"NVR SyncGuard v{APP_VERSION}"
+    try:
+        n_down = sum(1 for s in NVR_STATE.values() if s == "down")
+        with OFFLINE_CAMERA_LOCK:
+            n_cam_off = len(OFFLINE_CAMERA_IPS)
+        parts = [base]
+        if n_down:
+            parts.append(f"{n_down} NVR down")
+        if n_cam_off:
+            parts.append(f"{n_cam_off} camera(s) offline")
+        if len(parts) == 1:
+            parts.append("all healthy")
+        return " — ".join(parts)
+    except Exception:
+        return base
+
+
+def _refresh_tray_tooltip():
+    try:
+        if TRAY_ICON is not None:
+            TRAY_ICON.title = _build_tray_tooltip()
+    except Exception:
+        pass
+
+
+def _tray_open_window(icon, item):
+    try:
+        if 'root' in globals() and root:
+            root.after(0, lambda: (root.deiconify(), root.lift(),
+                                   root.focus_force()))
+    except Exception as e:
+        log_line(f"[TRAY] Open window failed: {e}")
+
+
+def _tray_run_now(icon, item):
+    try:
+        if 'root' in globals() and root:
+            root.after(0, _trigger_manual_scan_from_tray)
+    except Exception as e:
+        log_line(f"[TRAY] Run-now failed: {e}")
+
+
+def _tray_open_logs(icon, item):
+    try:
+        os.startfile(LOG_DIR)
+    except Exception as e:
+        log_line(f"[TRAY] Open logs failed: {e}")
+
+
+def _tray_open_reports(icon, item):
+    try:
+        os.startfile(DOWNLOADS_DIR)
+    except Exception as e:
+        log_line(f"[TRAY] Open reports failed: {e}")
+
+
+def _tray_toggle_autostart(icon, item):
+    try:
+        if is_autostart_registered():
+            unregister_autostart()
+        else:
+            register_autostart()
+    except Exception as e:
+        log_line(f"[TRAY] Toggle autostart failed: {e}")
+
+
+def _tray_exit(icon, item):
+    """User-initiated full exit. Only this stops the app completely."""
+    try:
+        MONITOR_STOP.set()
+    except Exception:
+        pass
+    try:
+        icon.stop()
+    except Exception:
+        pass
+    try:
+        if 'root' in globals() and root:
+            root.after(0, root.destroy)
+    except Exception:
+        pass
+    log_line("[TRAY] Exit requested by user")
+    try:
+        time.sleep(0.4)
+        os._exit(0)
+    except Exception:
+        pass
+
+
+def _tray_restart(icon, item):
+    try:
+        MONITOR_STOP.set()
+    except Exception:
+        pass
+    try:
+        icon.stop()
+    except Exception:
+        pass
+    try:
+        if getattr(sys, 'frozen', False):
+            subprocess.Popen([sys.executable, "--background"], close_fds=True)
+        else:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                             close_fds=True)
+    except Exception as e:
+        log_line(f"[TRAY] Restart failed: {e}")
+    try:
+        if 'root' in globals() and root:
+            root.after(0, root.destroy)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    os._exit(0)
+
+
+def _trigger_manual_scan_from_tray():
+    try:
+        if scan_running:
+            log_line("[TRAY] Scan already running")
+            return
+        if 'log' in globals() and 'btn' in globals() and 'tree_proxy' in globals():
+            start_all(log, btn, tree_proxy, status_label_proxy,
+                      auto_start=False)
+    except Exception as e:
+        log_line(f"[TRAY] Manual scan failed: {e}")
+
+
+def start_tray_icon():
+    global TRAY_ICON
+    try:
+        import pystray
+    except ImportError:
+        log_line("[TRAY] pystray not installed — running without tray icon")
+        return
+
+    image = _load_tray_image()
+    if image is None:
+        log_line("[TRAY] No icon image available")
+        return
+
+    def _autostart_label(item):
+        return "Autostart: ON" if is_autostart_registered() else "Autostart: OFF"
+
+    def _status_label(item):
+        return _build_tray_tooltip()
+
+    menu = pystray.Menu(
+        pystray.MenuItem(_status_label, None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Open NVR SyncGuard", _tray_open_window, default=True),
+        pystray.MenuItem("Run scan now", _tray_run_now),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Open reports folder", _tray_open_reports),
+        pystray.MenuItem("Open logs folder", _tray_open_logs),
+        pystray.MenuItem(_autostart_label, _tray_toggle_autostart),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Restart app", _tray_restart),
+        pystray.MenuItem("Exit (fully close)", _tray_exit),
+    )
+
+    try:
+        TRAY_ICON = pystray.Icon("nvrsyncguard", image,
+                                 _build_tray_tooltip(), menu)
+        thread = threading.Thread(target=TRAY_ICON.run, daemon=True)
+        thread.start()
+        log_line("[TRAY] Tray icon started")
+    except Exception as e:
+        log_line(f"[TRAY] Failed to start tray icon: {e}")
+
+
+# =========================================================
+# PING HELPERS
+# =========================================================
+def _ping_tcp(ip, port=80, timeout=3):
+    """Try a TCP connect to ip:port. Returns True if the port accepts."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+
+
+def _ping_icmp(ip, timeout=3):
+    """Use Windows ping command. Returns True if reply received."""
+    try:
+        cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout + 2)
+        out = (result.stdout or "").lower()
+        return ("ttl=" in out) or ("reply from" in out)
+    except Exception:
+        return False
+
+
+def _is_camera_reachable(ip, timeout=None):
+    if not ip or not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
+        return False
+    if timeout is None:
+        timeout = CAMERA_PING_TIMEOUT_SECONDS
+    if CAMERA_PING_METHOD == "icmp":
+        return _ping_icmp(ip, timeout=timeout)
+    # default: TCP
+    for port in (80, 554, 8000):
+        try:
+            if _ping_tcp(ip, port=port, timeout=timeout):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_nvr_reachable(url, timeout=5):
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status < 500
+        except Exception:
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status < 500
+            except Exception:
+                return False
+    except Exception:
+        return False
+
+
+def _register_offline_camera(ip, nvr_host="", name=""):
+    if not ip:
+        return
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
+        return
+    with OFFLINE_CAMERA_LOCK:
+        if ip not in OFFLINE_CAMERA_IPS:
+            OFFLINE_CAMERA_IPS[ip] = {
+                "since": datetime.now(),
+                "last_check": None,
+                "nvr": nvr_host,
+                "name": name,
+            }
+            log_line(f"[CAMERA] Registered offline camera {ip} ({name})")
+
+
+def _camera_ping_worker():
+    """Every CAMERA_PING_INTERVAL_SECONDS ping each offline camera IP.
+    When one comes back, remove it from the offline list and notify."""
+    log_line("[CAMERA] Camera-ping worker started")
+    ping_log("[CAMERA] Camera-ping worker started")
+    while not MONITOR_STOP.is_set():
+        try:
+            if not CAMERA_PING_ENABLED:
+                MONITOR_STOP.wait(5)
+                continue
+
+            with OFFLINE_CAMERA_LOCK:
+                ips = list(OFFLINE_CAMERA_IPS.keys())
+
+            if not ips:
+                UI_QUEUE.put(("stats", None))
+                MONITOR_STOP.wait(min(CAMERA_PING_INTERVAL_SECONDS, 5))
+                continue
+
+            recovered = []
+            for ip in ips:
+                if MONITOR_STOP.is_set():
+                    break
+                with OFFLINE_CAMERA_LOCK:
+                    info = OFFLINE_CAMERA_IPS.get(ip)
+                if not info:
+                    continue
+
+                t0 = time.time()
+                ok = _is_camera_reachable(ip)
+                latency = int((time.time() - t0) * 1000)
+
+                CAMERA_PING_HISTORY[ip] = {
+                    "last": datetime.now(),
+                    "state": "up" if ok else "down",
+                    "latency_ms": latency if ok else None,
+                }
+
+                with OFFLINE_CAMERA_LOCK:
+                    if ip in OFFLINE_CAMERA_IPS:
+                        OFFLINE_CAMERA_IPS[ip]["last_check"] = datetime.now()
+
+                if ok:
+                    recovered.append(ip)
+                    ping_log(f"[CAMERA] {ip} replied ({latency} ms) — back online")
+                else:
+                    ping_log(f"[CAMERA] {ip} still offline")
+
+            if recovered:
+                for ip in recovered:
+                    with OFFLINE_CAMERA_LOCK:
+                        OFFLINE_CAMERA_IPS.pop(ip, None)
+                show_toast("Camera back online",
+                           f"{len(recovered)} camera(s) responded: "
+                           + ", ".join(recovered[:5])
+                           + ("" if len(recovered) <= 5 else " …"))
+                _refresh_tray_tooltip()
+
+            UI_QUEUE.put(("stats", None))
+            MONITOR_STOP.wait(max(1, CAMERA_PING_INTERVAL_SECONDS))
+        except Exception as e:
+            log_line(f"[CAMERA] Worker error: {e}")
+            MONITOR_STOP.wait(5)
+
+    log_line("[CAMERA] Camera-ping worker stopped")
+    ping_log("[CAMERA] Camera-ping worker stopped")
+
+
+# =========================================================
+# FILE NAMING
 # =========================================================
 def _build_target_excel_path():
     base_name = BASE_EXCEL_FILENAME or "OfflineCameras.xlsx"
-    root, ext = os.path.splitext(base_name)
+    root_, ext = os.path.splitext(base_name)
     if not ext:
         ext = ".xlsx"
 
     if USE_DATE_STAMPED_FILES:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        new_name = f"{root}_{stamp}{ext}"
+        new_name = f"{root_}_{stamp}{ext}"
     else:
         new_name = base_name
 
@@ -479,13 +1121,16 @@ def find_chrome_path():
 
 def get_chromedriver_path(log=None):
     try:
+        bundled = os.path.join(BASE_DIR, "chromedriver.exe")
+        if os.path.exists(bundled):
+            return bundled
+    except Exception:
+        pass
+    try:
         chromedriver_path = ChromeDriverManager().install()
-        if log:
-            log.insert(tk.END, f"[OK] ChromeDriver: {os.path.basename(chromedriver_path)}\n")
         return chromedriver_path
     except Exception as e:
-        if log:
-            log.insert(tk.END, f"[WARN] WebDriverManager failed: {e}\n")
+        log_line(f"[WARN] WebDriverManager failed: {e}")
         try:
             chromedriver_path = shutil.which('chromedriver')
             if chromedriver_path:
@@ -502,10 +1147,10 @@ def get_chromedriver_path(log=None):
         ]
         for base_path in common_paths:
             if os.path.exists(base_path):
-                for root, dirs, files in os.walk(base_path):
+                for rt, dirs, files in os.walk(base_path):
                     for file in files:
                         if file in ('chromedriver.exe', 'chromedriver'):
-                            return os.path.join(root, file)
+                            return os.path.join(rt, file)
         return None
 
 
@@ -515,7 +1160,6 @@ def setup_chrome_driver(log=None):
     if chrome_path:
         options.binary_location = chrome_path
 
-    options.add_argument("--start-maximized")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -528,8 +1172,13 @@ def setup_chrome_driver(log=None):
     options.add_argument("--disable-features=NetworkService")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
-    # Faster page loads for slow NVRs
     options.add_argument("--page-load-strategy=eager")
+
+    if BACKGROUND_MODE and not _manual_scan_in_progress():
+        options.add_argument("--headless=new")
+    else:
+        options.add_argument("--start-maximized")
+
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
     options.add_experimental_option('useAutomationExtension', False)
     prefs = {
@@ -539,6 +1188,13 @@ def setup_chrome_driver(log=None):
     }
     options.add_experimental_option("prefs", prefs)
     return options
+
+
+def _manual_scan_in_progress():
+    try:
+        return bool(scan_running) and not _background_scan_flag[0]
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -570,13 +1226,32 @@ def save_config():
     config["USE_DATE_STAMPED_FILES"] = USE_DATE_STAMPED_FILES
     config["OVERLAY_WAIT_TIMEOUT"] = OVERLAY_WAIT_TIMEOUT
     config["CLICK_MAX_ATTEMPTS"] = CLICK_MAX_ATTEMPTS
+    config["NVR_RETRY_ATTEMPTS"] = NVR_RETRY_ATTEMPTS
+    config["NVR_RETRY_WAIT_SECONDS"] = NVR_RETRY_WAIT_SECONDS
+    config["ELEMENT_READY_TIMEOUT"] = ELEMENT_READY_TIMEOUT
+    config["PAGE_READY_TIMEOUT"] = PAGE_READY_TIMEOUT
+    config["BACKGROUND_MODE"] = BACKGROUND_MODE
+    config["START_MINIMIZED_TO_TRAY"] = START_MINIMIZED_TO_TRAY
+    config["MONITOR_INTERVAL_MINUTES"] = MONITOR_INTERVAL_MINUTES
+    config["SHOW_TOASTS"] = SHOW_TOASTS
+    config["AUTOSTART_WITH_WINDOWS"] = AUTOSTART_WITH_WINDOWS
+    config["NVR_DOWN_RETRY_BASE_SECONDS"] = NVR_DOWN_RETRY_BASE_SECONDS
+    config["NVR_DOWN_RETRY_MAX_SECONDS"] = NVR_DOWN_RETRY_MAX_SECONDS
+    config["RUN_SCAN_ON_LAUNCH"] = RUN_SCAN_ON_LAUNCH
+    config["BACKGROUND_PING_MONITOR"] = BACKGROUND_PING_MONITOR
+    config["AUTO_SCAN_ON_RECOVERY"] = AUTO_SCAN_ON_RECOVERY
+    config["MONITOR_INTERVAL_SECONDS"] = MONITOR_INTERVAL_SECONDS
+    config["CAMERA_PING_ENABLED"] = CAMERA_PING_ENABLED
+    config["CAMERA_PING_INTERVAL_SECONDS"] = CAMERA_PING_INTERVAL_SECONDS
+    config["CAMERA_PING_TIMEOUT_SECONDS"] = CAMERA_PING_TIMEOUT_SECONDS
+    config["CAMERA_PING_METHOD"] = CAMERA_PING_METHOD
     config.pop("USERNAME", None)
     config.pop("PASSWORD", None)
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as config_file:
             json.dump(config, config_file, indent=4)
     except OSError as error:
-        messagebox.showerror("Settings could not be saved", str(error))
+        log_line(f"[ERROR] save_config: {error}")
 
 
 def normalize_nvr_url(value):
@@ -599,7 +1274,7 @@ def _nvr_host_only(url):
 
 
 # =========================================================
-# WAIT HELPERS (dynamic)
+# WAIT HELPERS
 # =========================================================
 def _wait(driver, timeout, condition, desc, log=None, fatal=False):
     try:
@@ -640,11 +1315,43 @@ def _any_present(*xpaths):
 
 def _any_clickable(*xpaths):
     def _predicate(driver):
+        try:
+            ready = driver.execute_script("return document.readyState")
+            if ready != "complete":
+                return False
+        except Exception:
+            pass
+
         for xp in xpaths:
             try:
-                for el in driver.find_elements(By.XPATH, xp):
-                    if el.is_displayed() and el.is_enabled():
-                        return el
+                els = driver.find_elements(By.XPATH, xp)
+                for el in els:
+                    try:
+                        if not el.is_displayed() or not el.is_enabled():
+                            continue
+                        rect = el.rect
+                        if rect.get("width", 0) <= 0 or rect.get("height", 0) <= 0:
+                            continue
+                        try:
+                            cx = rect["x"] + rect["width"] / 2
+                            cy = rect["y"] + rect["height"] / 2
+                            top = driver.execute_script(
+                                "return document.elementFromPoint(arguments[0], arguments[1]);",
+                                cx, cy
+                            )
+                            if top is None:
+                                continue
+                            if top == el:
+                                return el
+                            if driver.execute_script(
+                                "return arguments[0].contains(arguments[1]) || arguments[1].contains(arguments[0]);",
+                                top, el
+                            ):
+                                return el
+                        except Exception:
+                            return el
+                    except Exception:
+                        continue
             except Exception:
                 continue
         return False
@@ -660,36 +1367,26 @@ def _small_buffer(log=None):
 
 
 # =========================================================
-# OVERLAY-SAFE CLICK HELPERS
+# OVERLAY-SAFE CLICK
 # =========================================================
 def _wait_overlay_gone(driver, timeout=None):
-    """
-    Wait until any visible full-screen overlay disappears.
-    Detects the NVR's transparent-black loading div.
-    """
     if timeout is None:
         timeout = OVERLAY_WAIT_TIMEOUT
-
     end_time = time.time() + timeout
     overlay_xpaths = [
-        # Transparent black full-screen overlay (NVR specific)
         "//div[contains(@style,'height: 100%') and "
         "(contains(@style,'rgb(0, 0, 0)') or contains(@style,'rgba(0, 0, 0'))]",
-        # Any fixed-position overlay with high z-index
         "//div[contains(@style,'position: fixed') and "
         "contains(@style,'z-index') and contains(@style,'opacity')]",
-        # Common loading masks
         "//div[contains(@class,'loading') and contains(@class,'mask')]",
         "//div[contains(@class,'mask') and contains(@class,'show')]",
     ]
-
     while time.time() < end_time:
         try:
             blocking = False
             for xp in overlay_xpaths:
                 try:
-                    elements = driver.find_elements(By.XPATH, xp)
-                    for el in elements:
+                    for el in driver.find_elements(By.XPATH, xp):
                         try:
                             if not el.is_displayed():
                                 continue
@@ -717,48 +1414,44 @@ def _wait_overlay_gone(driver, timeout=None):
 
 def _safe_click(driver, element, log=None, desc="element",
                 max_attempts=None, wait_overlay=True):
-    """
-    Robust click that handles overlay interception.
-    Strategy:
-      1. Wait for overlays to disappear.
-      2. Try normal click.
-      3. Fallback: JavaScript click (bypasses overlay).
-      4. Fallback: Scroll into view + retry.
-    Retries up to max_attempts times.
-    """
     if max_attempts is None:
         max_attempts = CLICK_MAX_ATTEMPTS
 
     def _log(msg):
         if log:
             try:
-                log.insert(tk.END, msg)
+                log.insert(tk.END, redact(msg))
             except Exception:
                 pass
 
+    try:
+        WebDriverWait(driver, PAGE_READY_TIMEOUT).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        pass
+
     for attempt in range(1, max_attempts + 1):
-        # 1) Wait for overlay
         if wait_overlay:
             _wait_overlay_gone(driver)
 
-        # 2) Scroll into view
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({block:'center', inline:'center'});",
                 element
             )
+            time.sleep(0.3)
         except Exception:
             pass
 
-        # 3) Try normal click
         try:
             element.click()
             _log(f"[OK] {desc} clicked\n")
             return True
-        except Exception:
-            pass
+        except Exception as e1:
+            first = (str(e1).splitlines() or [""])[0][:100]
+            _log(f"[..] {desc}: native click failed ({first}), trying JS…\n")
 
-        # 4) Try JavaScript click
         try:
             driver.execute_script("arguments[0].click();", element)
             _log(f"[OK] {desc} clicked (JS)\n")
@@ -766,400 +1459,36 @@ def _safe_click(driver, element, log=None, desc="element",
         except Exception:
             pass
 
-        # 5) Wait and retry
+        try:
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+                    try {
+                        el.dispatchEvent(new MouseEvent(t, {
+                            bubbles:true, cancelable:true, view:window
+                        }));
+                    } catch(e) {}
+                });
+                """,
+                element
+            )
+            _log(f"[OK] {desc} clicked (synthetic)\n")
+            return True
+        except Exception:
+            pass
+
         if attempt < max_attempts:
-            time.sleep(1.5)
+            wait_s = min(2 ** attempt, 8)
+            _log(f"[..] {desc}: attempt {attempt} failed, backoff {wait_s}s\n")
+            time.sleep(wait_s)
 
     _log(f"[WARN] Could not click {desc} after {max_attempts} attempts\n")
     return False
 
 
 # =========================================================
-# UI ACTIONS
-# =========================================================
-def add_nvr_from_ui():
-    global NVR_LIST
-    raw_url = nvr_entry.get()
-    raw_user = nvr_user_entry.get().strip()
-    raw_pass = nvr_pass_entry.get()
-
-    try:
-        nvr_url = normalize_nvr_url(raw_url)
-    except ValueError as error:
-        messagebox.showwarning("Check the NVR address", str(error))
-        nvr_entry.focus_set()
-        return
-
-    if not raw_user:
-        messagebox.showwarning("Username required",
-                               "Enter the username for this NVR.")
-        nvr_user_entry.focus_set()
-        return
-    if not raw_pass:
-        if not messagebox.askyesno("Password empty",
-                                   "Password is empty. Add this NVR anyway?"):
-            nvr_pass_entry.focus_set()
-            return
-
-    for existing in NVR_LIST:
-        if existing["url"] == nvr_url:
-            messagebox.showinfo("Already added",
-                                "This NVR is already in the list.")
-            return
-
-    NVR_LIST.append({"url": nvr_url,
-                     "username": raw_user,
-                     "password": raw_pass})
-
-    nvr_listbox.insert(tk.END, f"{nvr_url}  ·  {raw_user}")
-    nvr_entry.set("")
-    nvr_user_entry.set("")
-    nvr_pass_entry.set("")
-    save_config()
-    refresh_nvr_count()
-
-
-def remove_selected_nvr():
-    global NVR_LIST
-    selected = nvr_listbox.curselection()
-    if not selected:
-        messagebox.showinfo("Select an NVR", "Choose an NVR from the list first.")
-        return
-    index = selected[0]
-
-    if not request_admin_authorization(root,
-                                       "Removing an NVR requires password approval."):
-        return
-
-    nvr_listbox.delete(index)
-    del NVR_LIST[index]
-    save_config()
-    refresh_nvr_count()
-
-
-def refresh_nvr_count():
-    try:
-        nvr_count_label.config(text=f"{len(NVR_LIST)} configured")
-    except Exception:
-        pass
-
-
-def open_company_website(event=None):
-    try:
-        webbrowser.open_new(CODRAZE_URL)
-    except Exception as e:
-        messagebox.showerror("Error", f"Could not open website: {str(e)}")
-
-
-def save_all_settings():
-    """Save BOTH checkboxes (date-stamp + collect-all-IPs) at once."""
-    global USE_DATE_STAMPED_FILES, COLLECT_ALL_IPS, date_stamp_var
-
-    try:
-        if date_stamp_var is not None:
-            USE_DATE_STAMPED_FILES = bool(date_stamp_var.get())
-    except Exception:
-        pass
-
-    try:
-        COLLECT_ALL_IPS = bool(collect_ips_var.get())
-    except Exception:
-        pass
-
-    config["USE_DATE_STAMPED_FILES"] = USE_DATE_STAMPED_FILES
-    config["COLLECT_ALL_IPS"] = COLLECT_ALL_IPS
-    save_config()
-
-    date_state = "ON" if USE_DATE_STAMPED_FILES else "OFF"
-    ips_state = "ON" if COLLECT_ALL_IPS else "OFF"
-
-    try:
-        log.insert(tk.END,
-                   f"[SAVED] Settings — new file each scan: {date_state}, "
-                   f"collect ALL IPs: {ips_state}\n")
-    except Exception:
-        pass
-
-    messagebox.showinfo(
-        "Settings saved",
-        f"✅ New file each scan: {date_state}\n"
-        f"✅ Collect ALL camera IPs: {ips_state}\n\n"
-        "Saved to config.json."
-    )
-
-
-# =========================================================
-# CHANGE REPORT LOCATION (password protected)
-# =========================================================
-def change_report_location():
-    global DOWNLOADS_DIR, EXCEL_FILE
-
-    if not request_admin_authorization(
-        root,
-        "Changing the report folder requires administrator approval."
-    ):
-        return
-
-    try:
-        chosen = filedialog.askdirectory(
-            parent=root,
-            title="Select a folder to save the Excel reports",
-            initialdir=DOWNLOADS_DIR if os.path.isdir(DOWNLOADS_DIR) else os.path.expanduser("~"),
-            mustexist=False,
-        )
-    except Exception as e:
-        messagebox.showerror("Folder chooser failed", str(e), parent=root)
-        return
-
-    if not chosen:
-        return
-
-    chosen = os.path.abspath(chosen)
-
-    try:
-        os.makedirs(chosen, exist_ok=True)
-    except Exception as e:
-        messagebox.showerror(
-            "Folder not usable",
-            f"Could not create/access this folder:\n{chosen}\n\n{e}",
-            parent=root,
-        )
-        return
-
-    DOWNLOADS_DIR = chosen
-    EXCEL_FILE = os.path.join(DOWNLOADS_DIR, BASE_EXCEL_FILENAME)
-
-    config["DOWNLOADS_DIR"] = DOWNLOADS_DIR
-    save_config()
-
-    try:
-        last_saved_label.config(text=f"Folder: {DOWNLOADS_DIR}")
-    except Exception:
-        pass
-
-    try:
-        log.insert(tk.END,
-                   f"[SAVED] Report folder changed to: {DOWNLOADS_DIR}\n")
-    except Exception:
-        pass
-
-    messagebox.showinfo(
-        "Report folder updated",
-        f"Reports will now be saved in:\n\n{DOWNLOADS_DIR}\n\n"
-        + ("Each scan creates a new file with date & time in the name.\n"
-           if USE_DATE_STAMPED_FILES else
-           "The file will be overwritten on every scan.\n")
-        + "This setting has been saved to config.json.",
-        parent=root,
-    )
-
-
-def open_reports_folder():
-    """Open the folder where reports are saved (no password needed)."""
-    try:
-        folder = DOWNLOADS_DIR
-        if not os.path.isdir(folder):
-            os.makedirs(folder, exist_ok=True)
-        os.startfile(folder)
-    except Exception as e:
-        messagebox.showerror("Could not open folder", str(e), parent=root)
-
-
-# =========================================================
-# IFRAME-AWARE TIME SYNC (dynamic WebDriverWait + safe click)
-# =========================================================
-def sync_time(log):
-    options = setup_chrome_driver(log)
-    chromedriver_path = get_chromedriver_path(log)
-    if not chromedriver_path:
-        log.insert(tk.END, "[ERROR] Cannot proceed without ChromeDriver\n")
-        return
-
-    for entry in NVR_LIST:
-        if stop_requested:
-            break
-        nvr_url = entry["url"]
-        user = entry["username"]
-        pwd = entry["password"]
-        log.insert(tk.END, f"\n>> Time sync: {nvr_url}  (user: {user})\n")
-
-        driver = None
-        try:
-            service = Service(chromedriver_path)
-            driver = webdriver.Chrome(service=service, options=options)
-
-            log.insert(tk.END, f"[..] Opening {nvr_url}\n")
-            driver.get(nvr_url)
-
-            user_el = _wait(driver, TIMEOUT_LOGIN,
-                            EC.presence_of_element_located((By.ID, "username")),
-                            "login username", log, fatal=False)
-            if user_el is None:
-                log.insert(tk.END, "[WARN] Username field not found — skipping time sync.\n")
-                continue
-            user_el.send_keys(user)
-
-            pass_el = _wait(driver, TIMEOUT_LOGIN,
-                            EC.presence_of_element_located((By.ID, "password")),
-                            "login password", log, fatal=False)
-            if pass_el is None:
-                log.insert(tk.END, "[WARN] Password field not found — skipping.\n")
-                continue
-            pass_el.send_keys(pwd + Keys.RETURN)
-            log.insert(tk.END, "[OK] Credentials submitted\n")
-
-            cfg_el = _wait(driver, TIMEOUT_DASHBOARD,
-                           _any_clickable(
-                               "//a[contains(text(),'Configuration')]",
-                               "//a[@ng-click=\"jumpTo('config')\"]",
-                               "//*[contains(text(),'Configuration') and (self::a or self::li or self::div or self::span)]",
-                           ),
-                           "Configuration link", log)
-            if cfg_el is None:
-                log.insert(tk.END, "[WARN] Could not open Configuration — skipping.\n")
-                continue
-
-            if not _safe_click(driver, cfg_el, log, "Configuration"):
-                log.insert(tk.END, "[WARN] Configuration click failed — skipping.\n")
-                continue
-            _small_buffer(log)
-
-            clicked_time = False
-            t_el = _wait(driver, TIMEOUT_TIME_MENU,
-                         _any_clickable(
-                             "//a[contains(text(),'Time Settings')]",
-                             "//li[contains(text(),'Time Settings')]",
-                             "//*[contains(text(),'Time Settings')]",
-                             "//a[contains(text(),'Time')]",
-                             "//li[contains(text(),'Time')]",
-                         ),
-                         "Time Settings link", log)
-            if t_el is not None:
-                if _safe_click(driver, t_el, log, "Time Settings"):
-                    clicked_time = True
-
-            if not clicked_time:
-                try:
-                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                except Exception:
-                    iframes = []
-                log.insert(tk.END, f"[..] Trying {len(iframes)} iframe(s) for Time Settings…\n")
-                for idx in range(len(iframes)):
-                    if stop_requested:
-                        break
-                    try:
-                        driver.switch_to.default_content()
-                        frames = driver.find_elements(By.TAG_NAME, "iframe")
-                        if idx >= len(frames):
-                            break
-                        driver.switch_to.frame(frames[idx])
-                        el = _wait(driver, 15,
-                                   _any_clickable(
-                                       "//a[contains(text(),'Time Settings')]",
-                                       "//li[contains(text(),'Time Settings')]",
-                                       "//*[contains(text(),'Time Settings')]",
-                                       "//a[contains(text(),'Time')]",
-                                       "//li[contains(text(),'Time')]",
-                                   ),
-                                   f"Time Settings in iframe[{idx}]", log)
-                        if el is not None:
-                            if _safe_click(driver, el, log,
-                                           f"Time Settings (iframe[{idx}])"):
-                                clicked_time = True
-                                break
-                    except Exception:
-                        continue
-                try:
-                    driver.switch_to.default_content()
-                except Exception:
-                    pass
-
-            if not clicked_time:
-                log.insert(tk.END, "[WARN] Time Settings not reachable — skipping time sync.\n")
-                continue
-
-            _small_buffer(log)
-
-            def _try_time_save():
-                sync_cb = _wait(driver, TIMEOUT_TIME_FORM,
-                                _any_present(
-                                    "//label[contains(text(),'Sync')]/preceding-sibling::input[@type='checkbox']",
-                                    "//input[@type='checkbox' and contains(@name,'sync')]",
-                                    "//input[@type='checkbox' and contains(@name,'Sync')]",
-                                    "//input[@type='checkbox']",
-                                ),
-                                "Sync checkbox", log)
-                if sync_cb is not None:
-                    try:
-                        if not sync_cb.is_selected():
-                            _safe_click(driver, sync_cb, log, "Sync checkbox")
-                    except Exception:
-                        pass
-
-                save_btn = _wait(driver, TIMEOUT_SAVE_CONFIRM,
-                                 _any_clickable(
-                                     "//*[@id='settingTime']/button",
-                                     "//button[contains(text(),'Save')]",
-                                     "//input[@type='button' and contains(@value,'Save')]",
-                                     "//input[@type='submit' and contains(@value,'Save')]",
-                                 ),
-                                 "Save button", log)
-                if save_btn is not None:
-                    return _safe_click(driver, save_btn, log, "Save button")
-                return False
-
-            saved = _try_time_save()
-
-            if not saved:
-                try:
-                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                except Exception:
-                    iframes = []
-                for idx in range(len(iframes)):
-                    if stop_requested or saved:
-                        break
-                    try:
-                        driver.switch_to.default_content()
-                        frames = driver.find_elements(By.TAG_NAME, "iframe")
-                        if idx >= len(frames):
-                            break
-                        driver.switch_to.frame(frames[idx])
-                        if _try_time_save():
-                            saved = True
-                            log.insert(tk.END, f"[OK] Time sync saved inside iframe[{idx}]\n")
-                            break
-                    except Exception:
-                        continue
-                try:
-                    driver.switch_to.default_content()
-                except Exception:
-                    pass
-
-            if saved:
-                log.insert(tk.END, f"[OK] Time sync saved for {nvr_url}\n")
-            else:
-                log.insert(tk.END,
-                           f"[WARN] Save button not found for {nvr_url} — set time manually.\n")
-
-            _small_buffer(log)
-
-        except Exception as e:
-            first_line = (str(e).splitlines() or [""])[0] or "unknown error"
-            log.insert(tk.END, f"[WARN] Time sync step failed for {nvr_url}: {first_line}\n")
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                try:
-                    time.sleep(TIMEOUT_BETWEEN_NVR)
-                except Exception:
-                    pass
-
-
-# =========================================================
-# CAMERA SCAN (dynamic WebDriverWait + safe click)
+# CAMERA EXTRACTION
 # =========================================================
 def extract_camera_ip_from_row_deep(row, nvr_ip):
     ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
@@ -1177,43 +1506,34 @@ def extract_camera_ip_from_row_deep(row, nvr_ip):
             return False
 
     candidates = []
-
     for tag in ("span", "div", "td", "li", "p", "label"):
         try:
             for el in row.find_elements(By.XPATH, f".//{tag}"):
-                try:
-                    t = (el.text or "").strip()
-                    if t:
-                        candidates.append(t)
-                except Exception:
-                    pass
-                try:
-                    tc = (el.get_attribute("textContent") or "").strip()
-                    if tc:
-                        candidates.append(tc)
-                except Exception:
-                    pass
-                try:
-                    iv = (el.get_attribute("innerText") or "").strip()
-                    if iv:
-                        candidates.append(iv)
-                except Exception:
-                    pass
+                for getter in (
+                    lambda: el.text,
+                    lambda: el.get_attribute("textContent"),
+                    lambda: el.get_attribute("innerText"),
+                ):
+                    try:
+                        t = (getter() or "").strip()
+                        if t:
+                            candidates.append(t)
+                    except Exception:
+                        pass
         except Exception:
             continue
 
-    try:
-        candidates.append((row.text or "").strip())
-    except Exception:
-        pass
-    try:
-        candidates.append((row.get_attribute("textContent") or "").strip())
-    except Exception:
-        pass
-    try:
-        candidates.append((row.get_attribute("innerText") or "").strip())
-    except Exception:
-        pass
+    for getter in (
+        lambda: row.text,
+        lambda: row.get_attribute("textContent"),
+        lambda: row.get_attribute("innerText"),
+    ):
+        try:
+            t = (getter() or "").strip()
+            if t:
+                candidates.append(t)
+        except Exception:
+            pass
 
     for text in candidates:
         if not text:
@@ -1229,16 +1549,13 @@ def extract_camera_ip_from_row(row, nvr_ip):
     if ip:
         return ip
     try:
-        row_text = row.text
         ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-        ip_matches = re.findall(ip_pattern, row_text)
-        nvr_ip_clean = _nvr_host_only(nvr_ip)
-        for ip in ip_matches:
-            if ip != nvr_ip_clean:
+        for ip in re.findall(ip_pattern, row.text):
+            if ip != _nvr_host_only(nvr_ip):
                 return ip
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 
 def extract_camera_name_from_row(row, camera_ip=None):
@@ -1273,15 +1590,382 @@ def extract_camera_name_from_row(row, camera_ip=None):
 
 
 # =========================================================
-# SAFE EXCEL WRITE (atomic)
+# TIME SYNC
+# =========================================================
+def _run_time_sync_for_nvr(driver, log):
+    try:
+        cfg_el = _wait(driver, TIMEOUT_DASHBOARD,
+                       _any_clickable(
+                           "//a[contains(text(),'Configuration')]",
+                           "//a[@ng-click=\"jumpTo('config')\"]",
+                           "//*[contains(text(),'Configuration') and (self::a or self::li or self::div or self::span)]",
+                       ),
+                       "Configuration link", log)
+        if cfg_el is None:
+            log.insert(tk.END, "[WARN] Configuration link not found — time sync skipped.\n")
+            return
+        if not _safe_click(driver, cfg_el, log, "Configuration"):
+            log.insert(tk.END, "[WARN] Configuration click failed — time sync skipped.\n")
+            return
+        _small_buffer(log)
+
+        clicked_time = False
+        t_el = _wait(driver, TIMEOUT_TIME_MENU,
+                     _any_clickable(
+                         "//a[contains(text(),'Time Settings')]",
+                         "//li[contains(text(),'Time Settings')]",
+                         "//*[contains(text(),'Time Settings')]",
+                         "//a[contains(text(),'Time')]",
+                         "//li[contains(text(),'Time')]",
+                     ),
+                     "Time Settings link", log)
+        if t_el is not None:
+            if _safe_click(driver, t_el, log, "Time Settings"):
+                clicked_time = True
+
+        if not clicked_time:
+            try:
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            except Exception:
+                iframes = []
+            for idx in range(len(iframes)):
+                if stop_requested:
+                    break
+                try:
+                    driver.switch_to.default_content()
+                    frames = driver.find_elements(By.TAG_NAME, "iframe")
+                    if idx >= len(frames):
+                        break
+                    driver.switch_to.frame(frames[idx])
+                    el = _wait(driver, 15,
+                               _any_clickable(
+                                   "//a[contains(text(),'Time Settings')]",
+                                   "//li[contains(text(),'Time Settings')]",
+                                   "//*[contains(text(),'Time Settings')]",
+                                   "//a[contains(text(),'Time')]",
+                                   "//li[contains(text(),'Time')]",
+                               ),
+                               f"Time Settings iframe[{idx}]", log)
+                    if el is not None:
+                        if _safe_click(driver, el, log,
+                                       f"Time Settings (iframe[{idx}])"):
+                            clicked_time = True
+                            break
+                except Exception:
+                    continue
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+        if not clicked_time:
+            log.insert(tk.END, "[WARN] Time Settings not reachable.\n")
+            return
+
+        _small_buffer(log)
+
+        def _try_save():
+            sync_cb = _wait(driver, TIMEOUT_TIME_FORM,
+                            _any_present(
+                                "//label[contains(text(),'Sync')]/preceding-sibling::input[@type='checkbox']",
+                                "//input[@type='checkbox' and contains(@name,'sync')]",
+                                "//input[@type='checkbox' and contains(@name,'Sync')]",
+                                "//input[@type='checkbox']",
+                            ),
+                            "Sync checkbox", log)
+            if sync_cb is not None:
+                try:
+                    if not sync_cb.is_selected():
+                        _safe_click(driver, sync_cb, log, "Sync checkbox")
+                except Exception:
+                    pass
+
+            save_btn = _wait(driver, TIMEOUT_SAVE_CONFIRM,
+                             _any_clickable(
+                                 "//*[@id='settingTime']/button",
+                                 "//button[contains(text(),'Save')]",
+                                 "//input[@type='button' and contains(@value,'Save')]",
+                                 "//input[@type='submit' and contains(@value,'Save')]",
+                             ),
+                             "Save button", log)
+            if save_btn is not None:
+                return _safe_click(driver, save_btn, log, "Save button")
+            return False
+
+        saved = _try_save()
+        if not saved:
+            try:
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            except Exception:
+                iframes = []
+            for idx in range(len(iframes)):
+                if stop_requested or saved:
+                    break
+                try:
+                    driver.switch_to.default_content()
+                    frames = driver.find_elements(By.TAG_NAME, "iframe")
+                    if idx >= len(frames):
+                        break
+                    driver.switch_to.frame(frames[idx])
+                    if _try_save():
+                        saved = True
+                        log.insert(tk.END, f"[OK] Time sync saved in iframe[{idx}]\n")
+                        break
+                except Exception:
+                    continue
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+        if saved:
+            log.insert(tk.END, "[OK] Time sync saved\n")
+        else:
+            log.insert(tk.END, "[WARN] Save button not found — set time manually.\n")
+        _small_buffer(log)
+    except Exception as e:
+        first_line = (str(e).splitlines() or [""])[0] or "unknown error"
+        log.insert(tk.END, f"[WARN] Time sync failed: {first_line}\n")
+
+
+# =========================================================
+# CAMERA SCAN
+# =========================================================
+def _run_camera_scan_for_nvr(driver, nvr_host, log, tree, status_label):
+    global total_cameras_count, online_cameras_count, offline_cameras_count
+
+    try:
+        cfg_el = _wait(driver, TIMEOUT_CONFIG_CLICK,
+                       _any_clickable(
+                           "//a[contains(text(),'Configuration')]",
+                           "//a[@ng-click=\"jumpTo('config')\"]",
+                       ),
+                       "Configuration link", log)
+        if cfg_el is None:
+            log.insert(tk.END, "[ERROR] Configuration not found.\n")
+            return
+        if not _safe_click(driver, cfg_el, log, "Configuration"):
+            log.insert(tk.END, "[ERROR] Configuration click failed.\n")
+            return
+        _small_buffer(log)
+
+        cs_el = _wait(driver, TIMEOUT_CAMERA_MENU,
+                      _any_clickable(
+                          '//*[@id="menu"]/div/div[2]/div[5]',
+                          "//div[contains(text(),'Camera Settings')]",
+                          "//*[contains(text(),'Camera') and contains(text(),'Settings')]",
+                      ),
+                      "Camera Settings", log)
+        if cs_el is None:
+            log.insert(tk.END, "[ERROR] Camera Settings not found.\n")
+            return
+        if not _safe_click(driver, cs_el, log, "Camera Settings"):
+            log.insert(tk.END, "[ERROR] Camera Settings click failed.\n")
+            return
+        _small_buffer(log)
+
+        table = _wait(driver, TIMEOUT_CAMERA_TABLE,
+                      EC.presence_of_element_located((By.ID, "tableDigitalChannels")),
+                      "camera table", log)
+
+        camera_rows = []
+        if table is not None:
+            _wait(driver, TIMEOUT_CAMERA_TABLE,
+                  lambda d: len(d.find_elements(
+                      By.XPATH,
+                      "//*[@id='tableDigitalChannels']//div[contains(@class,'row')]"
+                  )) > 0,
+                  "first camera row", log)
+            try:
+                camera_rows = table.find_elements(
+                    By.XPATH, ".//div[contains(@class, 'row')]")
+                log.insert(tk.END, f"[OK] Found {len(camera_rows)} cameras\n")
+            except Exception:
+                camera_rows = []
+
+        if not camera_rows:
+            try:
+                camera_rows = driver.find_elements(
+                    By.CLASS_NAME, "digital-channel-item")
+                if camera_rows:
+                    log.insert(tk.END,
+                               f"[OK] Found {len(camera_rows)} cameras (fallback)\n")
+            except Exception:
+                camera_rows = []
+
+        if not camera_rows:
+            log.insert(tk.END, "[ERROR] No cameras found.\n")
+            return
+
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        nvr_cameras = 0
+        nvr_online = 0
+        nvr_offline = 0
+
+        for i, row in enumerate(camera_rows):
+            if stop_requested:
+                break
+            try:
+                camera_ip = extract_camera_ip_from_row(row, nvr_host) or ""
+                camera_name = extract_camera_name_from_row(row, camera_ip)
+                if camera_name == "Name unavailable":
+                    camera_name = f"Camera {i + 1}"
+
+                row_text = row.text.lower()
+                status = "Online"
+                if any(w in row_text for w in ["offline", "disconnect"]):
+                    status = "Offline"
+                    nvr_offline += 1
+                elif any(w in row_text for w in ["abnormal", "error"]):
+                    status = "Abnormal"
+                    nvr_offline += 1
+                else:
+                    nvr_online += 1
+
+                record = {
+                    'nvr_ip': nvr_host,
+                    'camera_name': camera_name,
+                    'camera_ip': camera_ip,
+                    'status': status,
+                    'checked_at': checked_at,
+                }
+                camera_data.append(record)
+
+                if status in ["Offline", "Abnormal"]:
+                    offline_cameras_data.append(record)
+                    try:
+                        tree.insert("", tk.END,
+                                    values=(len(offline_cameras_data),
+                                            camera_name, camera_ip,
+                                            status, nvr_host),
+                                    tags=("offline",) if status == "Offline" else ("abnormal",))
+                    except Exception:
+                        pass
+                    log.insert(tk.END,
+                               f"[WARN] {camera_name} | {camera_ip} - {status}\n")
+                    if CAMERA_PING_ENABLED and camera_ip:
+                        _register_offline_camera(camera_ip, nvr_host, camera_name)
+                else:
+                    log.insert(tk.END, f"[OK] {camera_name} | {camera_ip} - Online\n")
+
+                nvr_cameras += 1
+            except Exception:
+                continue
+
+        total_cameras_count += nvr_cameras
+        online_cameras_count += nvr_online
+        offline_cameras_count += nvr_offline
+
+        log.insert(tk.END,
+                   f"\nSummary: {nvr_cameras} total, "
+                   f"{nvr_online} online, {nvr_offline} offline/abnormal\n")
+        try:
+            status_label.config(
+                text=f"Status: {total_cameras_count} total · "
+                     f"{online_cameras_count} online · "
+                     f"{offline_cameras_count} offline")
+        except Exception:
+            pass
+
+        _refresh_tray_tooltip()
+    except Exception as e:
+        log.insert(tk.END, f"[ERROR] Camera scan failed: {e}\n")
+
+
+# =========================================================
+# SINGLE-NVR SCAN + RETRY WRAPPER
+# =========================================================
+def _scan_one_nvr_attempt(driver, entry, tree, status_label, log):
+    nvr_url = entry["url"]
+    nvr_host = _nvr_host_only(nvr_url)
+    user = entry["username"]
+    pwd = entry["password"]
+
+    log.insert(tk.END, f"\n{'=' * 60}\n")
+    log.insert(tk.END, f"NVR: {nvr_url}  (user: {user})\n")
+    log.insert(tk.END, f"{'=' * 60}\n")
+
+    try:
+        try:
+            driver.delete_all_cookies()
+        except Exception:
+            pass
+
+        driver.get(nvr_url)
+
+        user_el = _wait(driver, TIMEOUT_LOGIN,
+                        EC.presence_of_element_located((By.ID, "username")),
+                        "login username", log)
+        if user_el is None:
+            log.insert(tk.END, "[ERROR] Username field not found.\n")
+            return False
+        user_el.clear()
+        user_el.send_keys(user)
+
+        pass_el = _wait(driver, TIMEOUT_LOGIN,
+                        EC.presence_of_element_located((By.ID, "password")),
+                        "login password", log)
+        if pass_el is None:
+            log.insert(tk.END, "[ERROR] Password field not found.\n")
+            return False
+        pass_el.clear()
+        pass_el.send_keys(pwd + Keys.RETURN)
+        log.insert(tk.END, "[OK] Logged in\n")
+
+        log.insert(tk.END, "[INFO] Time sync phase…\n")
+        _run_time_sync_for_nvr(driver, log)
+
+        log.insert(tk.END, "[INFO] Camera scan phase…\n")
+        _run_camera_scan_for_nvr(driver, nvr_host, log, tree, status_label)
+        return True
+    except Exception as e:
+        first = (str(e).splitlines() or [""])[0][:200]
+        log.insert(tk.END, f"[ERROR] NVR attempt failed: {first}\n")
+        return False
+
+
+def _scan_one_nvr(driver, entry, tree, status_label, log):
+    nvr_url = entry["url"]
+    total_attempts = max(1, NVR_RETRY_ATTEMPTS + 1)
+
+    for attempt in range(1, total_attempts + 1):
+        if stop_requested:
+            log.insert(tk.END, "[INFO] Stop requested — aborting NVR retries.\n")
+            return False
+
+        log.insert(tk.END,
+                   f"\n>>> Attempt {attempt}/{total_attempts} for {nvr_url}\n")
+
+        ok = _scan_one_nvr_attempt(driver, entry, tree, status_label, log)
+        if ok:
+            return True
+
+        if attempt < total_attempts:
+            idx = min(attempt - 1, len(NVR_RETRY_WAIT_SECONDS) - 1)
+            wait_s = NVR_RETRY_WAIT_SECONDS[idx]
+            log.insert(tk.END,
+                       f"[RETRY] {nvr_url} failed attempt {attempt}. "
+                       f"Waiting {wait_s}s before retry {attempt + 1}…\n")
+            for _ in range(int(wait_s)):
+                if stop_requested:
+                    log.insert(tk.END, "[INFO] Stop requested during retry wait.\n")
+                    return False
+                time.sleep(1)
+
+    log.insert(tk.END,
+               f"[SKIP] {nvr_url} — all {total_attempts} attempts failed. "
+               f"Moving to next NVR.\n")
+    return False
+
+
+# =========================================================
+# EXCEL REPORT
 # =========================================================
 def _safe_replace_excel(wb, target_path, log):
     target_dir = os.path.dirname(target_path) or "."
     os.makedirs(target_dir, exist_ok=True)
-
     fd, tmp_path = tempfile.mkstemp(prefix=".nvr_sync_", suffix=".xlsx", dir=target_dir)
     os.close(fd)
-
     try:
         wb.save(tmp_path)
     except Exception as e:
@@ -1303,7 +1987,7 @@ def _safe_replace_excel(wb, target_path, log):
             os.replace(target_path, backup_path)
             moved = True
         except PermissionError:
-            for attempt in range(6):
+            for _ in range(6):
                 try:
                     os.remove(target_path)
                     moved = True
@@ -1317,17 +2001,12 @@ def _safe_replace_excel(wb, target_path, log):
                     break
         except Exception:
             pass
-
         if not moved and os.path.exists(target_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-            raise RuntimeError(
-                f"Excel file is locked by another program:\n{target_path}\n\n"
-                "Please close the Excel file (or any viewer that has it open) "
-                "and click EXPORT again."
-            )
+            raise RuntimeError(f"Excel file is locked: {target_path}")
 
     try:
         os.replace(tmp_path, target_path)
@@ -1450,13 +2129,6 @@ def save_excel_report(log):
                 ws.cell(row=row_num, column=5).value = status
                 ws.cell(row=row_num, column=6).value = checked
 
-                try:
-                    log.insert(tk.END,
-                               f"[EXCEL] Row {idx}: {cam_name} | "
-                               f"{cam_ip} | {nvr_ip} | {status}\n")
-                except Exception:
-                    pass
-
                 sc = ws.cell(row=row_num, column=5)
                 if status == "Offline":
                     sc.fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
@@ -1518,214 +2190,161 @@ def save_excel_report(log):
         return False
 
 
-def check_cameras(log, tree, status_label):
-    global total_cameras_count, online_cameras_count, offline_cameras_count
-    global camera_data, offline_cameras_data
-
-    total_cameras_count = 0
-    online_cameras_count = 0
-    offline_cameras_count = 0
-    camera_data = []
-    offline_cameras_data = []
-
-    options = setup_chrome_driver(log)
-    chromedriver_path = get_chromedriver_path(log)
-    if not chromedriver_path:
-        log.insert(tk.END, "[ERROR] Cannot proceed without ChromeDriver\n")
-        return
-
-    for nvr_index, entry in enumerate(NVR_LIST):
-        if stop_requested:
-            break
-        nvr_url = entry["url"]
-        nvr_host = _nvr_host_only(nvr_url)
-        user = entry["username"]
-        pwd = entry["password"]
-
-        log.insert(tk.END, f"\n{'=' * 60}\n")
-        log.insert(tk.END, f"NVR {nvr_index + 1}/{len(NVR_LIST)}: {nvr_url}  (user: {user})\n")
-        log.insert(tk.END, f"{'=' * 60}\n")
-
-        driver = None
+# =========================================================
+# BACKGROUND PING MONITOR (NVRs)
+# =========================================================
+def _monitor_worker():
+    log_line("[MONITOR] Background ping monitor started")
+    ping_log("[MONITOR] Background ping monitor started")
+    while not MONITOR_STOP.is_set():
         try:
-            service = Service(chromedriver_path)
-            driver = webdriver.Chrome(service=service, options=options)
-
-            driver.get(nvr_url)
-
-            user_el = _wait(driver, TIMEOUT_LOGIN,
-                            EC.presence_of_element_located((By.ID, "username")),
-                            "login username", log, fatal=False)
-            if user_el is None:
-                log.insert(tk.END, "[ERROR] Username field not found — skipping NVR.\n")
+            if not BACKGROUND_PING_MONITOR:
+                MONITOR_STOP.wait(15)
                 continue
-            user_el.send_keys(user)
-
-            pass_el = _wait(driver, TIMEOUT_LOGIN,
-                            EC.presence_of_element_located((By.ID, "password")),
-                            "login password", log, fatal=False)
-            if pass_el is None:
-                log.insert(tk.END, "[ERROR] Password field not found — skipping NVR.\n")
-                continue
-            pass_el.send_keys(pwd + Keys.RETURN)
-            log.insert(tk.END, "[OK] Logged in\n")
-
-            # --- Configuration click with safe fallback ---
-            cfg_el = _wait(driver, TIMEOUT_CONFIG_CLICK,
-                           _any_clickable(
-                               "//a[contains(text(),'Configuration')]",
-                               "//a[@ng-click=\"jumpTo('config')\"]",
-                           ),
-                           "Configuration link", log)
-            if cfg_el is None:
-                log.insert(tk.END, "[ERROR] Configuration not found — skipping NVR.\n")
+            if not NVR_LIST:
+                MONITOR_STOP.wait(30)
                 continue
 
-            if not _safe_click(driver, cfg_el, log, "Configuration"):
-                log.insert(tk.END, "[ERROR] Configuration click failed — skipping NVR.\n")
-                continue
-            _small_buffer(log)
+            ping_log(f"[MONITOR] Ping check on {len(NVR_LIST)} NVR(s)…")
 
-            # --- Camera Settings click with safe fallback ---
-            cs_el = _wait(driver, TIMEOUT_CAMERA_MENU,
-                          _any_clickable(
-                              '//*[@id="menu"]/div/div[2]/div[5]',
-                              "//div[contains(text(),'Camera Settings')]",
-                              "//*[contains(text(),'Camera') and contains(text(),'Settings')]",
-                          ),
-                          "Camera Settings", log)
-            if cs_el is None:
-                log.insert(tk.END, "[ERROR] Camera Settings not found — skipping NVR.\n")
-                continue
-
-            if not _safe_click(driver, cs_el, log, "Camera Settings"):
-                log.insert(tk.END, "[ERROR] Camera Settings click failed — skipping NVR.\n")
-                continue
-
-            _small_buffer(log)
-
-            table = _wait(driver, TIMEOUT_CAMERA_TABLE,
-                          EC.presence_of_element_located((By.ID, "tableDigitalChannels")),
-                          "camera table (#tableDigitalChannels)", log)
-
-            camera_rows = []
-            if table is not None:
-                _wait(driver, TIMEOUT_CAMERA_TABLE,
-                      lambda d: len(d.find_elements(
-                          By.XPATH,
-                          "//*[@id='tableDigitalChannels']//div[contains(@class,'row')]"
-                      )) > 0,
-                      "first camera row", log)
-                try:
-                    camera_rows = table.find_elements(
-                        By.XPATH, ".//div[contains(@class, 'row')]")
-                    log.insert(tk.END, f"[OK] Found {len(camera_rows)} cameras\n")
-                except Exception:
-                    camera_rows = []
-
-            if not camera_rows:
-                try:
-                    camera_rows = driver.find_elements(
-                        By.CLASS_NAME, "digital-channel-item")
-                    if camera_rows:
-                        log.insert(tk.END,
-                                   f"[OK] Found {len(camera_rows)} cameras (fallback)\n")
-                except Exception:
-                    camera_rows = []
-
-            if not camera_rows:
-                log.insert(tk.END, "[ERROR] No cameras found — skipping NVR.\n")
-                continue
-
-            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            nvr_cameras = 0
-            nvr_online = 0
-            nvr_offline = 0
-
-            for i, row in enumerate(camera_rows[:64]):
-                if stop_requested:
+            for entry in NVR_LIST:
+                if MONITOR_STOP.is_set():
                     break
-                try:
-                    camera_ip = extract_camera_ip_from_row(row, nvr_host) or ""
-                    camera_name = extract_camera_name_from_row(row, camera_ip)
-                    if camera_name == "Name unavailable":
-                        camera_name = f"Camera {i + 1}"
+                if not BACKGROUND_PING_MONITOR:
+                    break
 
-                    row_text = row.text.lower()
-                    status = "Online"
-                    if any(w in row_text for w in ["offline", "disconnect"]):
-                        status = "Offline"
-                        nvr_offline += 1
-                    elif any(w in row_text for w in ["abnormal", "error"]):
-                        status = "Abnormal"
-                        nvr_offline += 1
-                    else:
-                        nvr_online += 1
+                url = entry["url"]
+                nvr_id = _nvr_host_only(url)
+                prev = NVR_STATE.get(nvr_id)
 
-                    record = {
-                        'nvr_ip': nvr_host,
-                        'camera_name': camera_name,
-                        'camera_ip': camera_ip,
-                        'status': status,
-                        'checked_at': checked_at,
-                    }
-                    camera_data.append(record)
+                t0 = time.time()
+                reachable = _is_nvr_reachable(url, timeout=5)
+                latency = int((time.time() - t0) * 1000)
 
-                    if status in ["Offline", "Abnormal"]:
-                        offline_cameras_data.append(record)
-                        tree.insert("", tk.END,
-                                    values=(len(offline_cameras_data),
-                                            camera_name, camera_ip,
-                                            status, nvr_host),
-                                    tags=("offline",) if status == "Offline" else ("abnormal",))
-                        log.insert(tk.END,
-                                   f"[WARN] {camera_name} | {camera_ip} - {status}\n")
-                    else:
-                        log.insert(tk.END, f"[OK] {camera_name} | {camera_ip} - Online\n")
+                now_state = "up" if reachable else "down"
+                NVR_PING_HISTORY[nvr_id] = {
+                    "last": datetime.now(),
+                    "state": now_state,
+                    "latency_ms": latency if reachable else None,
+                }
 
-                    nvr_cameras += 1
-                except Exception:
+                if prev is None:
+                    NVR_STATE[nvr_id] = now_state
+                    ping_log(f"[MONITOR] {nvr_id}: initial state = {now_state}")
                     continue
 
-            total_cameras_count += nvr_cameras
-            online_cameras_count += nvr_online
-            offline_cameras_count += nvr_offline
+                if prev == "up" and now_state == "down":
+                    NVR_STATE[nvr_id] = "down"
+                    ping_log(f"[MONITOR] {nvr_id}: DOWN")
+                    show_toast("NVR DOWN", f"{nvr_id} is not responding.")
+                    _refresh_tray_tooltip()
+                elif prev == "down" and now_state == "up":
+                    NVR_STATE[nvr_id] = "up"
+                    ping_log(f"[MONITOR] {nvr_id}: BACK ONLINE ({latency} ms)")
+                    show_toast("NVR BACK ONLINE",
+                               f"{nvr_id} is reachable."
+                               + (" Syncing now…" if AUTO_SCAN_ON_RECOVERY
+                                  else " (recovery scan disabled)"))
+                    _refresh_tray_tooltip()
+                    if AUTO_SCAN_ON_RECOVERY:
+                        threading.Thread(
+                            target=_background_scan_one_nvr,
+                            args=(entry,), daemon=True,
+                        ).start()
 
-            log.insert(tk.END,
-                       f"\nSummary: {nvr_cameras} total, "
-                       f"{nvr_online} online, {nvr_offline} offline/abnormal\n")
-            status_label.config(
-                text=f"Status: {total_cameras_count} total · "
-                     f"{online_cameras_count} online · "
-                     f"{offline_cameras_count} offline")
+                MONITOR_STOP.wait(1)
 
+            UI_QUEUE.put(("stats", None))
+            MONITOR_STOP.wait(max(5, MONITOR_INTERVAL_SECONDS))
         except Exception as e:
-            log.insert(tk.END, f"[ERROR] {e}\n")
-        finally:
-            if driver:
+            log_line(f"[MONITOR] Worker error: {e}")
+            MONITOR_STOP.wait(10)
+
+    log_line("[MONITOR] Background ping monitor stopped")
+    ping_log("[MONITOR] Background ping monitor stopped")
+
+
+def _background_scan_one_nvr(entry):
+    global scan_running
+    if scan_running:
+        log_line("[MONITOR] A scan is already running — skipping recovery")
+        return
+
+    _background_scan_flag[0] = True
+    scan_running = True
+    chromedriver_path = get_chromedriver_path()
+    if not chromedriver_path:
+        log_line("[MONITOR] No ChromeDriver — cannot recovery-scan")
+        scan_running = False
+        _background_scan_flag[0] = False
+        return
+
+    options = setup_chrome_driver()
+    driver = None
+    try:
+        service = Service(chromedriver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+
+        class _StubLog:
+            def insert(self, *a, **k):
                 try:
-                    driver.quit()
+                    txt = a[1] if len(a) > 1 else (a[0] if a else "")
+                    log_line(str(txt).rstrip("\n"))
                 except Exception:
                     pass
-                try:
-                    time.sleep(TIMEOUT_BETWEEN_NVR)
-                except Exception:
-                    pass
+            def delete(self, *a, **k):
+                pass
+            def see(self, *a, **k):
+                pass
+
+        class _StubTree:
+            def insert(self, *a, **k):
+                pass
+            def delete(self, *a, **k):
+                pass
+            def get_children(self):
+                return []
+
+        class _StubStatus:
+            def config(self, **k):
+                pass
+
+        log_line("[MONITOR] Waiting 30s before recovery scan…")
+        time.sleep(30)
+
+        stub_log = _StubLog()
+        stub_tree = _StubTree()
+        stub_status = _StubStatus()
+
+        log_line(f"[MONITOR] Recovery scan for {entry['url']}")
+        _scan_one_nvr(driver, entry, stub_tree, stub_status, stub_log)
+        try:
+            save_excel_report(stub_log)
+        except Exception as e:
+            log_line(f"[MONITOR] Excel save after recovery failed: {e}")
+        _refresh_tray_tooltip()
+    except Exception as e:
+        log_line(f"[MONITOR] Recovery scan failed for {entry['url']}: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        scan_running = False
+        _background_scan_flag[0] = False
 
 
 # =========================================================
-# THREAD-SAFE TK PROXIES
+# TK PROXIES
 # =========================================================
 class TkLogProxy:
     def __init__(self, widget):
         self.widget = widget
-
     def insert(self, *args):
         root.after(0, lambda: self.widget.insert(*args))
-
     def delete(self, *args):
         root.after(0, lambda: self.widget.delete(*args))
-
     def see(self, *args):
         root.after(0, lambda: self.widget.see(*args))
 
@@ -1733,13 +2352,10 @@ class TkLogProxy:
 class TkTreeProxy:
     def __init__(self, widget):
         self.widget = widget
-
     def insert(self, *args, **kwargs):
         root.after(0, lambda: self.widget.insert(*args, **kwargs))
-
     def delete(self, *args):
         root.after(0, lambda: self.widget.delete(*args))
-
     def get_children(self):
         return self.widget.get_children()
 
@@ -1747,9 +2363,203 @@ class TkTreeProxy:
 class TkLabelProxy:
     def __init__(self, widget):
         self.widget = widget
-
     def config(self, **kwargs):
         root.after(0, lambda: self.widget.config(**kwargs))
+
+
+# =========================================================
+# UI ACTIONS
+# =========================================================
+def add_nvr_from_ui():
+    global NVR_LIST
+    raw_url = nvr_entry.get()
+    raw_user = nvr_user_entry.get().strip()
+    raw_pass = nvr_pass_entry.get()
+
+    try:
+        nvr_url = normalize_nvr_url(raw_url)
+    except ValueError as error:
+        messagebox.showwarning("Check the NVR address", str(error))
+        nvr_entry.focus_set()
+        return
+
+    if not raw_user:
+        messagebox.showwarning("Username required",
+                               "Enter the username for this NVR.")
+        nvr_user_entry.focus_set()
+        return
+    if not raw_pass:
+        if not messagebox.askyesno("Password empty",
+                                   "Password is empty. Add this NVR anyway?"):
+            nvr_pass_entry.focus_set()
+            return
+
+    for existing in NVR_LIST:
+        if existing["url"] == nvr_url:
+            messagebox.showinfo("Already added", "This NVR is already in the list.")
+            return
+
+    NVR_LIST.append({"url": nvr_url,
+                     "username": raw_user,
+                     "password": raw_pass})
+
+    nvr_listbox.insert(tk.END, f"{nvr_url}  ·  {raw_user}")
+    nvr_entry.set("")
+    nvr_user_entry.set("")
+    nvr_pass_entry.set("")
+    save_config()
+    refresh_nvr_count()
+
+
+def remove_selected_nvr():
+    global NVR_LIST
+    selected = nvr_listbox.curselection()
+    if not selected:
+        messagebox.showinfo("Select an NVR", "Choose an NVR from the list first.")
+        return
+    index = selected[0]
+
+    if not request_admin_authorization(root,
+                                       "Removing an NVR requires password approval."):
+        return
+
+    removed_url = NVR_LIST[index]["url"]
+    nvr_listbox.delete(index)
+    del NVR_LIST[index]
+    try:
+        NVR_STATE.pop(_nvr_host_only(removed_url), None)
+    except Exception:
+        pass
+    save_config()
+    refresh_nvr_count()
+
+
+def refresh_nvr_count():
+    try:
+        nvr_count_label.config(text=f"{len(NVR_LIST)} configured")
+    except Exception:
+        pass
+
+
+def open_company_website(event=None):
+    try:
+        webbrowser.open_new(CODRAZE_URL)
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not open website: {str(e)}")
+
+
+def save_all_settings():
+    global USE_DATE_STAMPED_FILES, COLLECT_ALL_IPS
+    global RUN_SCAN_ON_LAUNCH, BACKGROUND_PING_MONITOR, AUTO_SCAN_ON_RECOVERY
+    global MONITOR_INTERVAL_MINUTES
+
+    try:
+        if date_stamp_var is not None:
+            USE_DATE_STAMPED_FILES = bool(date_stamp_var.get())
+    except Exception:
+        pass
+    try:
+        COLLECT_ALL_IPS = bool(collect_ips_var.get())
+    except Exception:
+        pass
+    try:
+        if run_scan_on_launch_var is not None:
+            RUN_SCAN_ON_LAUNCH = bool(run_scan_on_launch_var.get())
+    except Exception:
+        pass
+    try:
+        if bg_ping_var is not None:
+            BACKGROUND_PING_MONITOR = bool(bg_ping_var.get())
+    except Exception:
+        pass
+    try:
+        if auto_recovery_var is not None:
+            AUTO_SCAN_ON_RECOVERY = bool(auto_recovery_var.get())
+    except Exception:
+        pass
+    try:
+        if ping_interval_var is not None:
+            val = int(ping_interval_var.get())
+            if val < 1:
+                val = 1
+            if val > 1440:
+                val = 1440
+            MONITOR_INTERVAL_MINUTES = val
+    except Exception:
+        pass
+
+    config["USE_DATE_STAMPED_FILES"] = USE_DATE_STAMPED_FILES
+    config["COLLECT_ALL_IPS"] = COLLECT_ALL_IPS
+    config["RUN_SCAN_ON_LAUNCH"] = RUN_SCAN_ON_LAUNCH
+    config["BACKGROUND_PING_MONITOR"] = BACKGROUND_PING_MONITOR
+    config["AUTO_SCAN_ON_RECOVERY"] = AUTO_SCAN_ON_RECOVERY
+    config["MONITOR_INTERVAL_MINUTES"] = MONITOR_INTERVAL_MINUTES
+    save_config()
+
+    messagebox.showinfo(
+        "Settings saved",
+        f"New file each scan: {'ON' if USE_DATE_STAMPED_FILES else 'OFF'}\n"
+        f"Collect ALL IPs: {'ON' if COLLECT_ALL_IPS else 'OFF'}\n"
+        f"Run scan on launch: {'ON' if RUN_SCAN_ON_LAUNCH else 'OFF'}\n"
+        f"Background ping monitor: {'ON' if BACKGROUND_PING_MONITOR else 'OFF'}\n"
+        f"Auto-scan on recovery: {'ON' if AUTO_SCAN_ON_RECOVERY else 'OFF'}\n"
+        f"Ping interval: {MONITOR_INTERVAL_MINUTES} min\n\n"
+        "Saved to config.json."
+    )
+
+
+def change_report_location():
+    global DOWNLOADS_DIR, EXCEL_FILE
+    if not request_admin_authorization(
+        root,
+        "Changing the report folder requires administrator approval."
+    ):
+        return
+    try:
+        chosen = filedialog.askdirectory(
+            parent=root,
+            title="Select a folder to save the Excel reports",
+            initialdir=DOWNLOADS_DIR if os.path.isdir(DOWNLOADS_DIR) else os.path.expanduser("~"),
+            mustexist=False,
+        )
+    except Exception as e:
+        messagebox.showerror("Folder chooser failed", str(e), parent=root)
+        return
+    if not chosen:
+        return
+    chosen = os.path.abspath(chosen)
+    try:
+        os.makedirs(chosen, exist_ok=True)
+    except Exception as e:
+        messagebox.showerror(
+            "Folder not usable",
+            f"Could not create/access this folder:\n{chosen}\n\n{e}",
+            parent=root,
+        )
+        return
+    DOWNLOADS_DIR = chosen
+    EXCEL_FILE = os.path.join(DOWNLOADS_DIR, BASE_EXCEL_FILENAME)
+    config["DOWNLOADS_DIR"] = DOWNLOADS_DIR
+    save_config()
+    try:
+        last_saved_label.config(text=f"Folder: {DOWNLOADS_DIR}")
+    except Exception:
+        pass
+    messagebox.showinfo(
+        "Report folder updated",
+        f"Reports will now be saved in:\n\n{DOWNLOADS_DIR}",
+        parent=root,
+    )
+
+
+def open_reports_folder():
+    try:
+        folder = DOWNLOADS_DIR
+        if not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
+        os.startfile(folder)
+    except Exception as e:
+        messagebox.showerror("Could not open folder", str(e), parent=root)
 
 
 # =========================================================
@@ -1779,23 +2589,19 @@ class RoundedFrame:
                               highlightthickness=0, bd=0)
         self.outer.pack_propagate(False)
         self.outer.grid_propagate(False)
-
         self.canvas = tk.Canvas(self.outer, highlightthickness=0, bd=0,
                                 bg=parent_bg)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
-
         self.inner = tk.Frame(self.outer, bg=bg)
         self.inner.place(x=padding, y=padding,
                          relwidth=1, relheight=1,
                          width=-2 * padding, height=-2 * padding)
-
         self._radius = radius
         self._bg = bg
         self._border = border
         self._bw = border_width
         self._w = width
         self._h = height
-
         self.outer.bind("<Configure>", self._redraw)
         self.outer.after(80, self._redraw)
 
@@ -1810,16 +2616,12 @@ class RoundedFrame:
 
     def configure(self, **kwargs):
         return self.outer.configure(**kwargs)
-
     def config(self, **kwargs):
         return self.outer.configure(**kwargs)
-
     def pack(self, **kwargs):
         return self.outer.pack(**kwargs)
-
     def grid(self, **kwargs):
         return self.outer.grid(**kwargs)
-
     def place(self, **kwargs):
         return self.outer.place(**kwargs)
 
@@ -1844,7 +2646,6 @@ class RoundedButton:
         self._w = width
         self._h = height
         self._enabled = True
-
         self.canvas.bind("<Configure>", self._draw)
         self.canvas.bind("<Enter>",
                          lambda e: self._paint(self._hover) if self._enabled else None)
@@ -1901,13 +2702,10 @@ class RoundedButton:
 
     def pack(self, **kwargs):
         return self.canvas.pack(**kwargs)
-
     def grid(self, **kwargs):
         return self.canvas.grid(**kwargs)
-
     def place(self, **kwargs):
         return self.canvas.place(**kwargs)
-
     def configure(self, **kwargs):
         return self.canvas.configure(**kwargs)
 
@@ -1921,11 +2719,9 @@ class RoundedEntry:
                               highlightthickness=0, bd=0)
         self.outer.pack_propagate(False)
         self.outer.grid_propagate(False)
-
         self.canvas = tk.Canvas(self.outer, highlightthickness=0, bd=0,
                                 bg=parent_bg)
         self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
-
         self.radius = radius
         self._bg = bg
         self._border = border
@@ -1933,7 +2729,6 @@ class RoundedEntry:
         self._w = width
         self._h = height
         self._focused = False
-
         self.var = tk.StringVar()
         self.entry = tk.Entry(self.outer, textvariable=self.var, bd=0,
                               relief="flat", bg=bg, fg="#0f172a",
@@ -1942,7 +2737,6 @@ class RoundedEntry:
                               highlightthickness=0)
         self.entry.place(x=14, y=10, relwidth=1, relheight=1,
                          width=-28, height=-20)
-
         self.entry.bind("<FocusIn>", self._on_focus_in)
         self.entry.bind("<FocusOut>", self._on_focus_out)
         self.outer.bind("<Configure>", self._redraw)
@@ -1951,11 +2745,9 @@ class RoundedEntry:
     def _on_focus_in(self, event):
         self._focused = True
         self._redraw()
-
     def _on_focus_out(self, event):
         self._focused = False
         self._redraw()
-
     def _redraw(self, event=None):
         w = self.outer.winfo_width() or self._w
         h = self.outer.winfo_height() or self._h
@@ -1969,39 +2761,30 @@ class RoundedEntry:
 
     def get(self):
         return self.var.get()
-
     def set(self, value):
         self.var.set(value)
-
     def delete(self, a, b):
         self.var.set("")
-
     def insert(self, index, value):
         self.var.set(value)
-
     def focus_set(self):
         self.entry.focus_set()
-
     def pack(self, **kwargs):
         return self.outer.pack(**kwargs)
-
     def grid(self, **kwargs):
         return self.outer.grid(**kwargs)
-
     def place(self, **kwargs):
         return self.outer.place(**kwargs)
-
     def configure(self, **kwargs):
         return self.outer.configure(**kwargs)
 
 
 # =========================================================
-# AUTO-CLOSE SCHEDULER (12:00 PM)
+# AUTO-CLOSE
 # =========================================================
 def _schedule_auto_close():
     if not AUTO_CLOSE_ENABLED:
         return
-
     def _worker():
         last_fired_date = None
         while True:
@@ -2018,7 +2801,6 @@ def _schedule_auto_close():
             except Exception:
                 pass
             time.sleep(20)
-
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -2028,7 +2810,6 @@ def _perform_auto_close():
         stop_requested = True
     except Exception:
         pass
-
     dlg = tk.Toplevel(root)
     dlg.title("Auto-close")
     dlg.configure(bg="#ffffff")
@@ -2036,8 +2817,7 @@ def _perform_auto_close():
     dlg.transient(root)
     dlg.grab_set()
 
-    tk.Label(dlg, text="Scheduled auto-close",
-             bg="#ffffff", fg="#0f172a",
+    tk.Label(dlg, text="Scheduled auto-close", bg="#ffffff", fg="#0f172a",
              font=("Segoe UI", 14, "bold")).pack(padx=26, pady=(22, 4))
     tk.Label(dlg,
              text=f"It is now {AUTO_CLOSE_HOUR:02d}:{AUTO_CLOSE_MINUTE:02d}. "
@@ -2045,31 +2825,21 @@ def _perform_auto_close():
              bg="#ffffff", fg="#475569",
              font=("Segoe UI", 10), wraplength=340,
              justify="center").pack(padx=26, pady=(0, 10))
-
     countdown_lbl = tk.Label(dlg, text="Closing in 10 seconds…",
                              bg="#ffffff", fg="#dc2626",
                              font=("Segoe UI", 11, "bold"))
     countdown_lbl.pack(padx=26, pady=(0, 16))
-
     state = {"remaining": 10}
 
     def _force_close():
-        try:
-            dlg.destroy()
-        except Exception:
-            pass
-        try:
-            root.quit()
-        except Exception:
-            pass
-        try:
-            root.destroy()
-        except Exception:
-            pass
-        try:
-            os._exit(0)
-        except Exception:
-            pass
+        try: dlg.destroy()
+        except Exception: pass
+        try: root.quit()
+        except Exception: pass
+        try: root.destroy()
+        except Exception: pass
+        try: os._exit(0)
+        except Exception: pass
 
     def _tick():
         try:
@@ -2078,25 +2848,20 @@ def _perform_auto_close():
                 return
             countdown_lbl.config(
                 text=f"Closing in {state['remaining']} second"
-                     f"{'s' if state['remaining'] != 1 else ''}…"
-            )
+                     f"{'s' if state['remaining'] != 1 else ''}…")
             state["remaining"] -= 1
             dlg.after(1000, _tick)
         except Exception:
             _force_close()
 
     def _cancel():
-        try:
-            dlg.destroy()
-        except Exception:
-            pass
+        try: dlg.destroy()
+        except Exception: pass
 
     tk.Button(dlg, text="Cancel auto-close", command=_cancel,
               bg="#f1f5f9", fg="#0f172a", relief=tk.FLAT,
               font=("Segoe UI", 10), padx=14, pady=6).pack(pady=(0, 20))
-
     dlg.protocol("WM_DELETE_WINDOW", _cancel)
-
     dlg.update_idletasks()
     try:
         x = (dlg.winfo_screenwidth() - dlg.winfo_width()) // 2
@@ -2104,7 +2869,6 @@ def _perform_auto_close():
         dlg.geometry(f"+{x}+{y}")
     except Exception:
         pass
-
     dlg.after(1000, _tick)
 
 
@@ -2115,6 +2879,7 @@ def start_all(log, btn, tree, status_label, auto_start=False):
     global stop_requested, total_nvrs_count, total_cameras_count
     global online_cameras_count, offline_cameras_count
     global camera_data, offline_cameras_data, scan_running, COLLECT_ALL_IPS
+    global CHECKED_NVRS, SKIPPED_NVRS
 
     if scan_running:
         stop_requested = True
@@ -2133,12 +2898,18 @@ def start_all(log, btn, tree, status_label, auto_start=False):
 
     stop_requested = False
     scan_running = True
+    _background_scan_flag[0] = False
     total_nvrs_count = len(NVR_LIST)
     total_cameras_count = 0
     online_cameras_count = 0
     offline_cameras_count = 0
     camera_data = []
     offline_cameras_data = []
+    CHECKED_NVRS = 0
+    SKIPPED_NVRS = 0
+
+    UI_STATE["running"] = True
+    UI_STATE["phase"] = "scanning"
 
     btn.set_text("■  STOP SCAN")
     btn.set_colors(bg=COLORS["red"], hover=COLORS["red_dark"], active="#991b1b")
@@ -2147,55 +2918,88 @@ def start_all(log, btn, tree, status_label, auto_start=False):
     tree.delete(*tree.get_children())
 
     def task():
-        global scan_running
+        global scan_running, CHECKED_NVRS, SKIPPED_NVRS
+        driver = None
         try:
             chrome_path = find_chrome_path()
             if not chrome_path:
-                log.insert(tk.END,
-                           "[ERROR] Google Chrome not found. Install Chrome and retry.\n")
+                log.insert(tk.END, "[ERROR] Google Chrome not found.\n")
                 status_label.config(text="● Chrome not found", fg=COLORS["red"])
                 return
+
             log.insert(tk.END, f"[INFO] {APP_NAME} v{APP_VERSION} by {APP_AUTHOR}\n")
             log.insert(tk.END, f"[INFO] Chrome detected: {chrome_path}\n")
             log.insert(tk.END, f"[INFO] {len(NVR_LIST)} NVR(s) queued\n")
-            if USE_DATE_STAMPED_FILES:
-                log.insert(tk.END,
-                           "[INFO] Date-stamped mode: a NEW file will be created for this scan.\n")
-            else:
-                log.insert(tk.END,
-                           "[INFO] Legacy mode: the same file will be overwritten.\n")
-            if COLLECT_ALL_IPS:
-                log.insert(tk.END,
-                           "[INFO] Collect-all-IPs mode: all camera IPs will be saved.\n")
-            else:
-                log.insert(tk.END,
-                           "[INFO] Default mode: only offline/abnormal cameras will be saved.\n")
-            sync_time(log)
-            if not stop_requested:
-                log.insert(tk.END, "\n[INFO] Camera scan started…\n")
-                check_cameras(log, tree, status_label)
+            log.insert(tk.END,
+                       "[INFO] Foreground scan — browser will be visible.\n")
+            log.insert(tk.END,
+                       f"[INFO] Retry policy: {NVR_RETRY_ATTEMPTS} retries, "
+                       f"waits {NVR_RETRY_WAIT_SECONDS}\n")
 
-            if camera_data or offline_cameras_data:
-                if stop_requested:
+            chromedriver_path = get_chromedriver_path(log)
+            if not chromedriver_path:
+                log.insert(tk.END, "[ERROR] Cannot proceed without ChromeDriver\n")
+                return
+
+            options = setup_chrome_driver(log)
+
+            try:
+                service = Service(chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=options)
+                log.insert(tk.END, "[OK] Chrome started\n")
+            except Exception as e:
+                log.insert(tk.END, f"[ERROR] Could not start Chrome: {e}\n")
+                return
+
+            try:
+                for nvr_index, entry in enumerate(NVR_LIST):
+                    if stop_requested:
+                        break
                     log.insert(tk.END,
-                               "[INFO] Scan stopped — saving partial results…\n")
-                save_excel_report(log)
+                               f"\n[{nvr_index + 1}/{len(NVR_LIST)}] "
+                               f"{entry['url']}\n")
+                    ok = _scan_one_nvr(driver, entry, tree, status_label, log)
+                    if ok:
+                        NVR_STATE[_nvr_host_only(entry["url"])] = "up"
+                        CHECKED_NVRS += 1
+                    else:
+                        NVR_STATE[_nvr_host_only(entry["url"])] = "down"
+                        SKIPPED_NVRS += 1
+                    UI_QUEUE.put(("stats", None))
+                    if not stop_requested and TIMEOUT_BETWEEN_NVR > 0:
+                        time.sleep(TIMEOUT_BETWEEN_NVR)
 
-            if stop_requested:
-                status_label.config(text="● Scan stopped by user",
-                                    fg=COLORS["amber"])
-            else:
-                status_label.config(
-                    text=f"● Completed · Total {total_cameras_count} · "
-                         f"Online {online_cameras_count} · "
-                         f"Offline {offline_cameras_count}",
-                    fg=COLORS["green"])
+                if camera_data or offline_cameras_data:
+                    if stop_requested:
+                        log.insert(tk.END,
+                                   "[INFO] Scan stopped — saving partial results…\n")
+                    save_excel_report(log)
+
+                if stop_requested:
+                    status_label.config(text="● Scan stopped by user",
+                                        fg=COLORS["amber"])
+                else:
+                    status_label.config(
+                        text=f"● Completed · Total {total_cameras_count} · "
+                             f"Online {online_cameras_count} · "
+                             f"Offline {offline_cameras_count}",
+                        fg=COLORS["green"])
+                _refresh_tray_tooltip()
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
         except Exception as error:
             log.insert(tk.END, f"\n[ERROR] Scan failed: {error}\n")
             status_label.config(text="● Scan ended with an error",
                                 fg=COLORS["red"])
         finally:
             scan_running = False
+            UI_STATE["running"] = bool(BACKGROUND_PING_MONITOR)
+            UI_STATE["phase"] = "monitoring" if BACKGROUND_PING_MONITOR else "idle"
+            UI_QUEUE.put(("stats", None))
             root.after(0, lambda: (
                 btn.set_text("▶  START SCAN"),
                 btn.set_colors(bg=COLORS["blue"],
@@ -2220,37 +3024,44 @@ def export_report(log_widget):
 # =========================================================
 # MAIN GUI
 # =========================================================
-def main():
+status_label_proxy = None
+
+
+def _on_window_close():
+    """X button — hide to tray; the app keeps running."""
+    try:
+        root.withdraw()
+        log_line("[APP] Window hidden to tray (X pressed)")
+        if TRAY_ICON is None and (BACKGROUND_MODE or START_MINIMIZED_TO_TRAY):
+            start_tray_icon()
+    except Exception:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def main(start_hidden=False):
     global root, status_label, btn, log, nvr_listbox, nvr_entry
     global nvr_user_entry, nvr_pass_entry, collect_ips_var
     global nvr_count_label, COLORS, scan_running, last_saved_label
     global date_stamp_var
+    global run_scan_on_launch_var, bg_ping_var, auto_recovery_var, ping_interval_var
     global DOWNLOADS_DIR, EXCEL_FILE, USE_DATE_STAMPED_FILES
+    global status_label_proxy, log_ping
 
     scan_running = False
     COLORS = {
-        "bg": "#eef2f6",
-        "card": "#ffffff",
-        "ink": "#0f172a",
-        "ink_soft": "#1e293b",
-        "muted": "#64748b",
-        "line": "#e2e8f0",
-        "blue": "#2563eb",
-        "blue_dark": "#1d4ed8",
-        "blue_pale": "#eff6ff",
-        "blue_border": "#bfdbfe",
-        "red": "#dc2626",
-        "red_dark": "#b91c1c",
-        "red_pale": "#fef2f2",
-        "red_border": "#fecaca",
-        "green": "#059669",
-        "green_pale": "#ecfdf5",
-        "green_border": "#a7f3d0",
-        "amber": "#d97706",
-        "amber_pale": "#fffbeb",
-        "header": "#0b1220",
-        "header_2": "#111827",
-        "chip": "#1f2937",
+        "bg": "#eef2f6", "card": "#ffffff", "ink": "#0f172a",
+        "ink_soft": "#1e293b", "muted": "#64748b", "line": "#e2e8f0",
+        "blue": "#2563eb", "blue_dark": "#1d4ed8",
+        "blue_pale": "#eff6ff", "blue_border": "#bfdbfe",
+        "red": "#dc2626", "red_dark": "#b91c1c",
+        "red_pale": "#fef2f2", "red_border": "#fecaca",
+        "green": "#059669", "green_pale": "#ecfdf5", "green_border": "#a7f3d0",
+        "amber": "#d97706", "amber_pale": "#fffbeb",
+        "purple_pale": "#f5f3ff", "purple": "#6d28d9", "purple_border": "#ddd6fe",
+        "header": "#0b1220", "header_2": "#111827", "chip": "#1f2937",
     }
 
     root = tk.Tk()
@@ -2258,6 +3069,7 @@ def main():
     root.geometry("1480x980")
     root.minsize(1180, 800)
     root.configure(bg=COLORS["bg"])
+    root.protocol("WM_DELETE_WINDOW", _on_window_close)
 
     try:
         if os.path.exists(ICO_PATH):
@@ -2272,26 +3084,24 @@ def main():
                     fieldbackground=COLORS["card"], rowheight=36,
                     borderwidth=0, font=("Segoe UI", 10))
     style.configure("Treeview.Heading", background=COLORS["ink_soft"],
-                    foreground="white",
-                    font=("Segoe UI", 10, "bold"),
+                    foreground="white", font=("Segoe UI", 10, "bold"),
                     relief="flat", padding=(10, 10))
     style.map("Treeview",
               background=[("selected", COLORS["blue_pale"])],
               foreground=[("selected", COLORS["ink"])])
     style.configure("Vertical.TScrollbar",
-                    background=COLORS["card"],
-                    troughcolor=COLORS["card"], borderwidth=0, arrowsize=12)
+                    background=COLORS["card"], troughcolor=COLORS["card"],
+                    borderwidth=0, arrowsize=12)
 
     outer = tk.Frame(root, bg=COLORS["bg"])
     outer.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
 
-    # ---------------- HEADER ----------------
+    # ---------- HEADER ----------
     header = RoundedFrame(outer, radius=16, bg=COLORS["header"],
                           border=COLORS["header"], border_width=0,
                           padding=0, width=1000, height=120)
     header.pack(fill=tk.X, pady=(0, 16))
     header.configure(height=120)
-
     h = header.inner
 
     brand_container = tk.Frame(h, bg=COLORS["header"])
@@ -2300,16 +3110,14 @@ def main():
     _logo_image_holder = {"img": None}
 
     def _load_logo():
-        candidates = [LOGO_PATH, ICO_PATH,
-                      os.path.join("images", "logo.png"),
-                      os.path.join("images", "logo.ico")]
-        for path in candidates:
+        for path in [LOGO_PATH, ICO_PATH,
+                     os.path.join("images", "logo.png"),
+                     os.path.join("images", "logo.ico")]:
             if not path or not os.path.exists(path):
                 continue
             try:
                 from PIL import Image, ImageTk
-                img = Image.open(path).convert("RGBA")
-                img = img.resize((72, 72), Image.LANCZOS)
+                img = Image.open(path).convert("RGBA").resize((72, 72), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 _logo_image_holder["img"] = photo
                 return photo
@@ -2323,33 +3131,39 @@ def main():
         return None
 
     logo_photo = _load_logo()
-
     if logo_photo is not None:
         logo_tile = RoundedFrame(brand_container, radius=14,
                                  bg=COLORS["blue"], border=COLORS["blue"],
-                                 border_width=0, padding=6,
-                                 width=72, height=72)
+                                 border_width=0, padding=6, width=72, height=72)
         logo_tile.pack(fill=tk.BOTH, expand=True)
         logo_label = tk.Label(logo_tile.inner, image=logo_photo,
                               bg=COLORS["blue"], bd=0)
         logo_label.image = logo_photo
         logo_label.pack(expand=True)
     else:
-        brand_mark = tk.Label(brand_container, text="C",
-                              bg=COLORS["blue"], fg="#ffffff",
-                              font=("Segoe UI", 26, "bold"),
-                              width=2, height=1)
-        brand_mark.pack(fill=tk.BOTH, expand=True)
+        tk.Label(brand_container, text="C", bg=COLORS["blue"], fg="#ffffff",
+                 font=("Segoe UI", 26, "bold"), width=2, height=1
+                 ).pack(fill=tk.BOTH, expand=True)
 
     title_area = tk.Frame(h, bg=COLORS["header"])
     title_area.place(x=118, y=26)
-    tk.Label(title_area, text=APP_NAME,
-             bg=COLORS["header"], fg="#ffffff",
+    tk.Label(title_area, text=APP_NAME, bg=COLORS["header"], fg="#ffffff",
              font=("Segoe UI", 22, "bold")).pack(anchor="w")
-    tk.Label(title_area,
-             text="Auto-scan on launch  ·  Per-NVR credentials  ·  Daily Excel reports",
-             bg=COLORS["header"], fg="#94a3b8",
-             font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
+
+    subtitle_lbl = tk.Label(
+        title_area,
+        text="Background tray · Camera ping · Auto-sync on recovery",
+        bg=COLORS["header"], fg="#94a3b8",
+        font=("Segoe UI", 10))
+    subtitle_lbl.pack(anchor="w", pady=(2, 0))
+
+    menu_btn = RoundedButton(
+        h, text="☰", command=lambda: _toggle_left_panel(),
+        radius=10, bg="#1f2937", fg="#93c5fd",
+        hover_bg="#273449", active_bg="#0f172a",
+        width=46, height=42, font=("Segoe UI", 15, "bold"),
+    )
+    menu_btn.place(relx=1.0, x=-410, y=38)
 
     clock_label = tk.Label(h, text="", bg=COLORS["header"], fg="#cbd5e1",
                            font=("Segoe UI", 10))
@@ -2357,12 +3171,10 @@ def main():
 
     codraze_btn = RoundedButton(
         h, text=f"{APP_AUTHOR.upper()}  ↗",
-        command=open_company_website,
-        radius=12,
+        command=open_company_website, radius=12,
         bg="#1f2937", fg="#93c5fd",
         hover_bg="#273449", active_bg="#0f172a",
-        width=170, height=42,
-        font=("Segoe UI", 10, "bold"),
+        width=170, height=42, font=("Segoe UI", 10, "bold"),
     )
     codraze_btn.place(relx=1.0, x=-300, y=38)
 
@@ -2371,25 +3183,40 @@ def main():
         root.after(1000, tick)
     tick()
 
-    # ---------------- BODY ----------------
+    # ---------- BODY ----------
     body = tk.Frame(outer, bg=COLORS["bg"])
     body.pack(fill=tk.BOTH, expand=True)
-    body.grid_columnconfigure(0, weight=0, minsize=380)
+    body.grid_columnconfigure(0, weight=0)
     body.grid_columnconfigure(1, weight=1)
     body.grid_rowconfigure(0, weight=1)
 
-    left = tk.Frame(body, bg=COLORS["bg"])
-    left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+    left_holder = tk.Frame(body, bg=COLORS["bg"], width=380)
+    left_holder.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+    left_holder.grid_propagate(False)
 
+    left = tk.Frame(left_holder, bg=COLORS["bg"])
+    left.pack(fill=tk.BOTH, expand=True)
+
+    left_visible = {"v": True}
+
+    def _toggle_left_panel():
+        if left_visible["v"]:
+            left.pack_forget()
+            left_holder.configure(width=0)
+            left_visible["v"] = False
+        else:
+            left_holder.configure(width=380)
+            left.pack(fill=tk.BOTH, expand=True)
+            left_visible["v"] = True
+
+    # --- LEFT: NVR card ---
     nvr_card = RoundedFrame(left, radius=16, bg=COLORS["card"],
                             border=COLORS["line"], padding=20,
-                            width=360, height=680)
+                            width=360, height=820)
     nvr_card.pack(fill=tk.BOTH, expand=True)
-    nvr_card.configure(height=680)
-
     nv = nvr_card.inner
-    tk.Label(nv, text="ADD NEW NVR", bg=COLORS["card"],
-             fg=COLORS["ink"],
+
+    tk.Label(nv, text="ADD NEW NVR", bg=COLORS["card"], fg=COLORS["ink"],
              font=("Segoe UI", 12, "bold")).pack(anchor="w")
     tk.Label(nv, text="Password needed only to remove an NVR.",
              bg=COLORS["card"], fg=COLORS["muted"],
@@ -2401,17 +3228,14 @@ def main():
     nvr_entry = RoundedEntry(nv, radius=10, width=320, height=42)
     nvr_entry.pack(fill=tk.X)
 
-    tk.Label(nv, text="USERNAME",
-             bg=COLORS["card"], fg=COLORS["muted"],
+    tk.Label(nv, text="USERNAME", bg=COLORS["card"], fg=COLORS["muted"],
              font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
     nvr_user_entry = RoundedEntry(nv, radius=10, width=320, height=42)
     nvr_user_entry.pack(fill=tk.X)
     nvr_user_entry.set("admin")
 
-    tk.Label(nv, text="PASSWORD",
-             bg=COLORS["card"], fg=COLORS["muted"],
+    tk.Label(nv, text="PASSWORD", bg=COLORS["card"], fg=COLORS["muted"],
              font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
-
     pwd_row = tk.Frame(nv, bg=COLORS["card"])
     pwd_row.pack(fill=tk.X)
     nvr_pass_entry = RoundedEntry(pwd_row, radius=10, width=270,
@@ -2419,8 +3243,8 @@ def main():
     nvr_pass_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def toggle_pwd():
-        current = nvr_pass_entry.entry.cget("show")
-        nvr_pass_entry.entry.config(show="" if current else "●")
+        cur = nvr_pass_entry.entry.cget("show")
+        nvr_pass_entry.entry.config(show="" if cur else "●")
 
     eye_btn = RoundedButton(pwd_row, text="👁", command=toggle_pwd,
                             bg="#f1f5f9", fg=COLORS["ink"],
@@ -2430,45 +3254,30 @@ def main():
 
     add_row = tk.Frame(nv, bg=COLORS["card"])
     add_row.pack(fill=tk.X, pady=(14, 14))
-    add_btn = RoundedButton(add_row, text="+  ADD NVR",
-                            command=add_nvr_from_ui,
-                            bg=COLORS["blue"], hover_bg=COLORS["blue_dark"],
-                            active_bg="#1e40af", width=180, height=42)
-    add_btn.pack(side=tk.LEFT)
+    RoundedButton(add_row, text="+  ADD NVR", command=add_nvr_from_ui,
+                  bg=COLORS["blue"], hover_bg=COLORS["blue_dark"],
+                  active_bg="#1e40af", width=180, height=42).pack(side=tk.LEFT)
+    RoundedButton(add_row, text="🔒",
+                  command=lambda: _open_change_password_dialog(root),
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=42, height=42,
+                  font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, padx=(8, 0))
 
-    lock_btn = RoundedButton(
-        add_row, text="🔒",
-        command=lambda: _open_change_password_dialog(root),
-        bg="#f1f5f9", fg=COLORS["ink"],
-        hover_bg="#e2e8f0", active_bg="#cbd5e1",
-        width=42, height=42,
-        font=("Segoe UI", 13, "bold"),
-    )
-    lock_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-    # ---- Compact SETTINGS section ----
     settings_row = tk.Frame(nv, bg=COLORS["card"])
     settings_row.pack(fill=tk.X, pady=(0, 14))
-
     tk.Label(settings_row, text="⚙️  SETTINGS",
              bg=COLORS["card"], fg=COLORS["ink"],
              font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 8))
 
     folder_line = tk.Frame(settings_row, bg=COLORS["card"])
     folder_line.pack(fill=tk.X, pady=(0, 8))
-
-    tk.Label(folder_line, text="📁",
-             bg=COLORS["card"], fg=COLORS["muted"],
+    tk.Label(folder_line, text="📁", bg=COLORS["card"], fg=COLORS["muted"],
              font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=(0, 6))
-
-    folder_path_lbl = tk.Label(
-        folder_line,
-        text=DOWNLOADS_DIR,
-        bg=COLORS["card"], fg=COLORS["ink"],
-        font=("Consolas", 8),
-        anchor="w", justify="left",
-        wraplength=180,
-    )
+    folder_path_lbl = tk.Label(folder_line, text=DOWNLOADS_DIR,
+                               bg=COLORS["card"], fg=COLORS["ink"],
+                               font=("Consolas", 8),
+                               anchor="w", justify="left", wraplength=180)
     folder_path_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _change_folder_and_refresh(lbl):
@@ -2478,67 +3287,87 @@ def main():
         except Exception:
             pass
 
-    change_folder_btn = RoundedButton(
-        folder_line,
-        text="🔒 Change",
-        command=lambda: _change_folder_and_refresh(folder_path_lbl),
-        bg="#f1f5f9", fg=COLORS["ink"],
-        hover_bg="#e2e8f0", active_bg="#cbd5e1",
-        width=90, height=28,
-        font=("Segoe UI", 8, "bold"),
-    )
-    change_folder_btn.pack(side=tk.LEFT, padx=(6, 0))
-
-    open_folder_btn = RoundedButton(
-        folder_line,
-        text="📂 Open",
-        command=open_reports_folder,
-        bg="#eff6ff", fg="#1d4ed8",
-        hover_bg="#dbeafe", active_bg="#bfdbfe",
-        width=80, height=28,
-        font=("Segoe UI", 8, "bold"),
-    )
-    open_folder_btn.pack(side=tk.LEFT, padx=(6, 0))
+    RoundedButton(folder_line, text="🔒 Change",
+                  command=lambda: _change_folder_and_refresh(folder_path_lbl),
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=90, height=28,
+                  font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(6, 0))
+    RoundedButton(folder_line, text="📂 Open", command=open_reports_folder,
+                  bg="#eff6ff", fg="#1d4ed8",
+                  hover_bg="#dbeafe", active_bg="#bfdbfe",
+                  width=80, height=28,
+                  font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(6, 0))
 
     checks_line = tk.Frame(settings_row, bg=COLORS["card"])
     checks_line.pack(fill=tk.X, pady=(0, 8))
-
     date_stamp_var = tk.BooleanVar(value=USE_DATE_STAMPED_FILES)
-    date_chk = tk.Checkbutton(
-        checks_line,
-        text="New file each scan",
-        variable=date_stamp_var,
-        bg=COLORS["card"], fg=COLORS["ink"],
-        activebackground=COLORS["card"],
-        selectcolor="#ffffff",
-        font=("Segoe UI", 9),
-        anchor="w", justify="left",
-    )
-    date_chk.pack(side=tk.LEFT)
-
+    tk.Checkbutton(checks_line, text="New file each scan",
+                   variable=date_stamp_var,
+                   bg=COLORS["card"], fg=COLORS["ink"],
+                   activebackground=COLORS["card"],
+                   selectcolor="#ffffff",
+                   font=("Segoe UI", 9),
+                   anchor="w", justify="left").pack(side=tk.LEFT)
     collect_ips_var = tk.BooleanVar(value=COLLECT_ALL_IPS)
-    chk = tk.Checkbutton(
-        checks_line,
-        text="Collect ALL IPs",
-        variable=collect_ips_var,
-        bg=COLORS["card"], fg=COLORS["ink"],
-        activebackground=COLORS["card"],
-        selectcolor="#ffffff",
-        font=("Segoe UI", 9),
-        anchor="w", justify="left",
-    )
-    chk.pack(side=tk.LEFT, padx=(16, 0))
+    tk.Checkbutton(checks_line, text="Collect ALL IPs",
+                   variable=collect_ips_var,
+                   bg=COLORS["card"], fg=COLORS["ink"],
+                   activebackground=COLORS["card"],
+                   selectcolor="#ffffff",
+                   font=("Segoe UI", 9),
+                   anchor="w", justify="left").pack(side=tk.LEFT, padx=(16, 0))
 
-    save_settings_btn = RoundedButton(
-        settings_row,
-        text="💾  Save settings",
-        command=save_all_settings,
-        bg="#2563eb", fg="#ffffff",
-        hover_bg="#1d4ed8", active_bg="#1e40af",
-        width=200, height=34,
-        font=("Segoe UI", 9, "bold"),
-    )
-    save_settings_btn.pack(anchor="w")
+    tk.Label(settings_row, text="Background monitor",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(4, 2))
+
+    bg_checks = tk.Frame(settings_row, bg=COLORS["card"])
+    bg_checks.pack(fill=tk.X, pady=(0, 6))
+
+    run_scan_on_launch_var = tk.BooleanVar(value=RUN_SCAN_ON_LAUNCH)
+    tk.Checkbutton(bg_checks, text="Run scan on launch",
+                   variable=run_scan_on_launch_var,
+                   bg=COLORS["card"], fg=COLORS["ink"],
+                   activebackground=COLORS["card"],
+                   selectcolor="#ffffff",
+                   font=("Segoe UI", 9),
+                   anchor="w", justify="left").pack(anchor="w")
+
+    bg_ping_var = tk.BooleanVar(value=BACKGROUND_PING_MONITOR)
+    tk.Checkbutton(bg_checks, text="Background ping monitor (no browser)",
+                   variable=bg_ping_var,
+                   bg=COLORS["card"], fg=COLORS["ink"],
+                   activebackground=COLORS["card"],
+                   selectcolor="#ffffff",
+                   font=("Segoe UI", 9),
+                   anchor="w", justify="left").pack(anchor="w")
+
+    auto_recovery_var = tk.BooleanVar(value=AUTO_SCAN_ON_RECOVERY)
+    tk.Checkbutton(bg_checks, text="Auto-scan on recovery (when NVR comes back)",
+                   variable=auto_recovery_var,
+                   bg=COLORS["card"], fg=COLORS["ink"],
+                   activebackground=COLORS["card"],
+                   selectcolor="#ffffff",
+                   font=("Segoe UI", 9),
+                   anchor="w", justify="left").pack(anchor="w")
+
+    interval_row = tk.Frame(settings_row, bg=COLORS["card"])
+    interval_row.pack(fill=tk.X, pady=(4, 6))
+    tk.Label(interval_row, text="Ping interval (minutes):",
+             bg=COLORS["card"], fg=COLORS["ink"],
+             font=("Segoe UI", 9)).pack(side=tk.LEFT)
+    ping_interval_var = tk.StringVar(value=str(MONITOR_INTERVAL_MINUTES))
+    tk.Entry(interval_row, textvariable=ping_interval_var, width=6,
+             font=("Segoe UI", 9), justify="center",
+             bg="#f1f5f9", relief=tk.FLAT).pack(side=tk.LEFT, padx=(6, 0), ipady=3)
+
+    RoundedButton(settings_row, text="💾  Save settings",
+                  command=save_all_settings,
+                  bg="#2563eb", fg="#ffffff",
+                  hover_bg="#1d4ed8", active_bg="#1e40af",
+                  width=200, height=34,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 0))
 
     count_row = tk.Frame(nv, bg=COLORS["card"])
     count_row.pack(fill=tk.X, pady=(0, 6))
@@ -2553,9 +3382,9 @@ def main():
 
     list_wrap = RoundedFrame(nv, radius=10, bg="#f8fafc",
                              border=COLORS["line"], padding=6,
-                             width=320, height=120)
+                             width=320, height=160)
     list_wrap.pack(fill=tk.BOTH, expand=True)
-    list_wrap.configure(height=120)
+    list_wrap.configure(height=160)
     nvr_listbox = tk.Listbox(list_wrap.inner, font=("Consolas", 9),
                              bg="#f8fafc", fg=COLORS["ink"], relief=tk.FLAT,
                              selectbackground=COLORS["blue"],
@@ -2565,19 +3394,19 @@ def main():
     for entry in NVR_LIST:
         nvr_listbox.insert(tk.END, f"{entry['url']}  ·  {entry['username']}")
 
-    remove_btn = RoundedButton(nv, text="🔒  Remove selected (password)",
-                               command=remove_selected_nvr,
-                               bg=COLORS["red_pale"], fg=COLORS["red_dark"],
-                               hover_bg="#fee2e2", active_bg="#fecaca",
-                               width=210, height=34,
-                               font=("Segoe UI", 9, "bold"))
-    remove_btn.pack(anchor="w", pady=(10, 0))
+    RoundedButton(nv, text="🔒  Remove selected (password)",
+                  command=remove_selected_nvr,
+                  bg=COLORS["red_pale"], fg=COLORS["red_dark"],
+                  hover_bg="#fee2e2", active_bg="#fecaca",
+                  width=210, height=34,
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 0))
 
+    # --- RIGHT ---
     right = tk.Frame(body, bg=COLORS["bg"])
     right.grid(row=0, column=1, sticky="nsew")
     right.grid_columnconfigure(0, weight=1)
-    right.grid_rowconfigure(2, weight=3)
-    right.grid_rowconfigure(3, weight=2)
+    right.grid_rowconfigure(3, weight=3)
+    right.grid_rowconfigure(4, weight=2)
 
     action_bar = RoundedFrame(right, radius=16, bg=COLORS["card"],
                               border=COLORS["line"], padding=16,
@@ -2591,6 +3420,31 @@ def main():
                                    font=("Segoe UI", 11, "bold"))
     status_label_widget.pack(side=tk.LEFT, padx=(4, 0))
     status_label = TkLabelProxy(status_label_widget)
+    status_label_proxy = status_label
+
+    export_btn = RoundedButton(ab, text="⤓  EXPORT EXCEL",
+                               command=lambda: export_report(log),
+                               bg="#f1f5f9", fg=COLORS["ink"],
+                               hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                               width=160, height=46,
+                               font=("Segoe UI", 10, "bold"))
+    export_btn.pack(side=tk.RIGHT)
+
+    restart_btn = RoundedButton(ab, text="⟳  RESTART",
+                                command=lambda: _restart_app(),
+                                bg="#fef3c7", fg="#92400e",
+                                hover_bg="#fde68a", active_bg="#fcd34d",
+                                width=140, height=46,
+                                font=("Segoe UI", 10, "bold"))
+    restart_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
+    exit_btn = RoundedButton(ab, text="✕  EXIT",
+                             command=lambda: _full_exit(),
+                             bg="#fee2e2", fg="#991b1b",
+                             hover_bg="#fecaca", active_bg="#fca5a5",
+                             width=120, height=46,
+                             font=("Segoe UI", 10, "bold"))
+    exit_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
     btn = RoundedButton(ab, text="▶  START SCAN",
                         command=lambda: start_all(log, btn, tree_proxy,
@@ -2598,49 +3452,52 @@ def main():
                         bg=COLORS["blue"], hover_bg=COLORS["blue_dark"],
                         active_bg="#1e40af", width=180, height=46,
                         font=("Segoe UI", 11, "bold"))
-    btn.pack(side=tk.RIGHT, padx=(10, 0))
+    btn.pack(side=tk.RIGHT, padx=(0, 8))
 
-    export_btn = RoundedButton(ab, text="⤓  EXPORT EXCEL",
-                               command=lambda: export_report(log),
-                               bg="#f1f5f9", fg=COLORS["ink"],
-                               hover_bg="#e2e8f0", active_bg="#cbd5e1",
-                               width=170, height=46,
-                               font=("Segoe UI", 10, "bold"))
-    export_btn.pack(side=tk.RIGHT)
+    # ---- 6 STAT CARDS ----
+    stats_row1 = tk.Frame(right, bg=COLORS["bg"])
+    stats_row1.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+    stats_row2 = tk.Frame(right, bg=COLORS["bg"])
+    stats_row2.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+    for r in (stats_row1, stats_row2):
+        for c in range(3):
+            r.grid_columnconfigure(c, weight=1)
 
-    stats_row = tk.Frame(right, bg=COLORS["bg"])
-    stats_row.grid(row=1, column=0, sticky="ew", pady=(0, 14))
-    for c in range(4):
-        stats_row.grid_columnconfigure(c, weight=1)
-
-    stat_specs = [
-        ("TOTAL NVRS", "0", COLORS["blue_pale"],
-         COLORS["blue"], COLORS["blue_border"]),
-        ("TOTAL CAMERAS", "0", "#f5f3ff",
-         "#6d28d9", "#ddd6fe"),
-        ("ONLINE CAMERAS", "0", COLORS["green_pale"],
-         COLORS["green"], COLORS["green_border"]),
-        ("OFFLINE / ABNORMAL", "0", COLORS["red_pale"],
-         COLORS["red_dark"], COLORS["red_border"]),
-    ]
-    stat_cards = []
-    for i, (label, value, bg, fg, border) in enumerate(stat_specs):
-        card = RoundedFrame(stats_row, radius=14, bg=bg, border=border,
+    def _make_stat(parent, label, value, bg, fg, border):
+        card = RoundedFrame(parent, radius=14, bg=bg, border=border,
                             padding=14, width=210, height=86)
-        card.grid(row=0, column=i, sticky="ew",
-                  padx=(0 if i == 0 else 8, 8 if i < 3 else 0))
-        card.configure(height=86)
         tk.Label(card.inner, text=label, bg=bg, fg=COLORS["muted"],
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
         num = tk.Label(card.inner, text=value, bg=bg, fg=fg,
                        font=("Segoe UI", 22, "bold"))
         num.pack(anchor="w", pady=(2, 0))
-        stat_cards.append(num)
+        return card, num
 
+    nvr1_card, stat_nvr_total = _make_stat(stats_row1, "TOTAL NVRS", "0",
+                                           COLORS["blue_pale"], COLORS["blue"], COLORS["blue_border"])
+    nvr1_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    nvr2_card, stat_nvr_checked = _make_stat(stats_row1, "CHECKED NVRS", "0",
+                                             COLORS["green_pale"], COLORS["green"], COLORS["green_border"])
+    nvr2_card.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+    nvr3_card, stat_nvr_skipped = _make_stat(stats_row1, "SKIPPED NVRS", "0",
+                                             COLORS["amber_pale"], "#92400e", "#fcd34d")
+    nvr3_card.grid(row=0, column=2, sticky="ew")
+
+    cam1_card, stat_cam_total = _make_stat(stats_row2, "TOTAL CAMERAS", "0",
+                                           COLORS["purple_pale"], COLORS["purple"], COLORS["purple_border"])
+    cam1_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    cam2_card, stat_cam_online = _make_stat(stats_row2, "ONLINE CAMERAS", "0",
+                                            COLORS["green_pale"], COLORS["green"], COLORS["green_border"])
+    cam2_card.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+    cam3_card, stat_cam_offline = _make_stat(stats_row2, "OFFLINE / ABNORMAL", "0",
+                                             COLORS["red_pale"], COLORS["red_dark"], COLORS["red_border"])
+    cam3_card.grid(row=0, column=2, sticky="ew")
+
+    # Camera exceptions table
     results_card = RoundedFrame(right, radius=16, bg=COLORS["card"],
                                 border=COLORS["line"], padding=16,
-                                width=900, height=320)
-    results_card.grid(row=2, column=0, sticky="nsew", pady=(0, 14))
+                                width=900, height=280)
+    results_card.grid(row=3, column=0, sticky="nsew", pady=(0, 14))
     rc = results_card.inner
     rc.grid_columnconfigure(0, weight=1)
     rc.grid_rowconfigure(1, weight=1)
@@ -2671,24 +3528,28 @@ def main():
     tree.tag_configure("offline", background="#fef2f2", foreground="#991b1b")
     tree.tag_configure("abnormal", background="#fffbeb", foreground="#92400e")
 
-    tree_scroll = ttk.Scrollbar(rc, orient=tk.VERTICAL,
-                                command=tree.yview)
+    tree_scroll = ttk.Scrollbar(rc, orient=tk.VERTICAL, command=tree.yview)
     tree.configure(yscrollcommand=tree_scroll.set)
     tree_scroll.grid(row=1, column=1, sticky="ns", padx=(6, 0))
     tree_proxy = TkTreeProxy(tree)
 
-    log_card = RoundedFrame(right, radius=16, bg=COLORS["card"],
+    # Logs area
+    logs_row = tk.Frame(right, bg=COLORS["bg"])
+    logs_row.grid(row=4, column=0, sticky="nsew")
+    logs_row.grid_columnconfigure(0, weight=1, uniform="logcol")
+    logs_row.grid_columnconfigure(1, weight=1, uniform="logcol")
+    logs_row.grid_rowconfigure(0, weight=1)
+
+    log_card = RoundedFrame(logs_row, radius=16, bg=COLORS["card"],
                             border=COLORS["line"], padding=14,
-                            width=900, height=260)
-    log_card.grid(row=3, column=0, sticky="nsew")
+                            width=440, height=260)
+    log_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
     lc = log_card.inner
     lc.grid_columnconfigure(0, weight=1)
     lc.grid_rowconfigure(1, weight=1)
-
     tk.Label(lc, text="Activity log", bg=COLORS["card"], fg=COLORS["ink"],
              font=("Segoe UI", 11, "bold")).grid(row=0, column=0,
                                                  sticky="w", pady=(0, 6))
-
     log_widget = scrolledtext.ScrolledText(lc, wrap=tk.WORD,
                                            font=("Consolas", 9),
                                            bg="#0b1220", fg="#cbd5e1",
@@ -2698,39 +3559,184 @@ def main():
     log_widget.grid(row=1, column=0, sticky="nsew")
     log = TkLogProxy(log_widget)
 
+    ping_card = RoundedFrame(logs_row, radius=16, bg=COLORS["card"],
+                             border=COLORS["line"], padding=14,
+                             width=440, height=260)
+    ping_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+    pc = ping_card.inner
+    pc.grid_columnconfigure(0, weight=1)
+    pc.grid_rowconfigure(1, weight=1)
+    ping_header = tk.Frame(pc, bg=COLORS["card"])
+    ping_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    tk.Label(ping_header, text="Ping monitor",
+             bg=COLORS["card"], fg=COLORS["ink"],
+             font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
+    ping_count_lbl = tk.Label(ping_header, text="0 offline cameras",
+                              bg=COLORS["card"], fg=COLORS["muted"],
+                              font=("Segoe UI", 9))
+    ping_count_lbl.pack(side=tk.RIGHT)
+
+    ping_widget = scrolledtext.ScrolledText(pc, wrap=tk.WORD,
+                                            font=("Consolas", 9),
+                                            bg="#0b1220", fg="#a7f3d0",
+                                            relief=tk.FLAT,
+                                            insertbackground="#93c5fd",
+                                            selectbackground="#1e3a8a",
+                                            height=10)
+    ping_widget.grid(row=1, column=0, sticky="nsew")
+    log_ping = TkLogProxy(ping_widget)
+
+    for _l in PING_LOG_LINES:
+        ping_widget.insert(tk.END, _l + "\n")
+    ping_widget.see(tk.END)
+
+    # ---------- FOOTER ----------
     footer = tk.Frame(outer, bg=COLORS["bg"])
     footer.pack(fill=tk.X, pady=(12, 0))
     tk.Label(footer,
              text=f"{APP_NAME} v{APP_VERSION}  ·  by {APP_AUTHOR}  ·  © {APP_YEAR}",
              bg=COLORS["bg"], fg=COLORS["muted"],
              font=("Segoe UI", 9)).pack(side=tk.LEFT)
-
-    last_saved_label = tk.Label(footer,
-                                text=f"Folder: {DOWNLOADS_DIR}",
+    last_saved_label = tk.Label(footer, text=f"Folder: {DOWNLOADS_DIR}",
                                 bg=COLORS["bg"], fg=COLORS["muted"],
                                 font=("Segoe UI", 9))
     last_saved_label.pack(side=tk.RIGHT)
 
+    # ---------- RUNNING STATE PAINTER ----------
+    def _apply_running_state():
+        running = bool(UI_STATE.get("running")) or scan_running
+        if running:
+            btn.set_text("●  RUNNING…")
+            btn.set_colors(bg=COLORS["green"], hover=COLORS["green"],
+                           active=COLORS["green"], fg="#ffffff")
+            subtitle_lbl.config(
+                text="● Running in background — closing this window keeps it alive in the tray",
+                fg="#86efac")
+        else:
+            btn.set_text("▶  START SCAN")
+            btn.set_colors(bg=COLORS["blue"], hover=COLORS["blue_dark"],
+                           active="#1e40af", fg="#ffffff")
+            subtitle_lbl.config(
+                text="Background tray · Camera ping · Auto-sync on recovery",
+                fg="#94a3b8")
+
+    # ---------- UI QUEUE PUMP ----------
+    def _pump_ui_queue():
+        try:
+            while True:
+                kind, payload = UI_QUEUE.get_nowait()
+                if kind == "ping_log":
+                    try:
+                        ping_widget.insert(tk.END, payload + "\n")
+                        total_lines = int(ping_widget.index('end-1c').split('.')[0])
+                        if total_lines > PING_LOG_MAX:
+                            ping_widget.delete('1.0', '2.0')
+                        ping_widget.see(tk.END)
+                    except Exception:
+                        pass
+                elif kind == "stats":
+                    try:
+                        with OFFLINE_CAMERA_LOCK:
+                            n_cam_off = len(OFFLINE_CAMERA_IPS)
+                        ping_count_lbl.config(
+                            text=f"{n_cam_off} offline camera"
+                                 f"{'s' if n_cam_off != 1 else ''}")
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+        root.after(300, _pump_ui_queue)
+
     def update_stats():
-        stat_cards[0].config(text=str(len(NVR_LIST)))
-        stat_cards[1].config(text=str(total_cameras_count))
-        stat_cards[2].config(text=str(online_cameras_count))
-        stat_cards[3].config(text=str(offline_cameras_count))
+        stat_nvr_total.config(text=str(len(NVR_LIST)))
+        stat_nvr_checked.config(text=str(CHECKED_NVRS))
+        stat_nvr_skipped.config(text=str(SKIPPED_NVRS))
+        stat_cam_total.config(text=str(total_cameras_count))
+        stat_cam_online.config(text=str(online_cameras_count))
+        stat_cam_offline.config(text=str(offline_cameras_count))
         if last_saved_file:
             try:
                 last_saved_label.config(
                     text=f"Last: {os.path.basename(last_saved_file)}")
             except Exception:
                 pass
+        _apply_running_state()
         root.after(800, update_stats)
     update_stats()
+    _pump_ui_queue()
 
+    # ---------- RESTART / EXIT ----------
+    def _restart_app():
+        if not messagebox.askyesno(
+            "Restart NVR SyncGuard",
+            "Restart the application now?\n\n"
+            "The current window will close and the app will relaunch.",
+        ):
+            return
+        try:
+            MONITOR_STOP.set()
+        except Exception:
+            pass
+        try:
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([sys.executable, "--background"], close_fds=True)
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                                 close_fds=True)
+        except Exception as e:
+            log_line(f"[RESTART] Failed to relaunch: {e}")
+        try:
+            if TRAY_ICON is not None:
+                TRAY_ICON.stop()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def _full_exit():
+        if not messagebox.askyesno(
+            "Exit NVR SyncGuard",
+            "Exit fully?\n\nBackground ping monitoring and the tray icon "
+            "will stop.",
+        ):
+            return
+        try:
+            MONITOR_STOP.set()
+        except Exception:
+            pass
+        try:
+            if TRAY_ICON is not None:
+                TRAY_ICON.stop()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        log_line("[APP] Full exit")
+        try:
+            time.sleep(0.4)
+            os._exit(0)
+        except Exception:
+            pass
+
+    # ---------- AUTO LAUNCH ----------
     def auto_launch():
         if not NVR_LIST:
             log.insert(tk.END,
                        "[INFO] No NVR configured yet — add one on the left, "
                        "then click START SCAN.\n")
             status_label.config(text="● Waiting for first NVR",
+                                fg=COLORS["muted"])
+            return
+        if not RUN_SCAN_ON_LAUNCH:
+            log.insert(tk.END,
+                       "[INFO] 'Run scan on launch' is OFF — waiting. "
+                       "Background ping monitor will still watch NVRs.\n")
+            status_label.config(text="● Ready (auto-scan off)",
                                 fg=COLORS["muted"])
             return
         log.insert(tk.END,
@@ -2745,12 +3751,57 @@ def main():
         log.insert(tk.END,
                    f"[INFO] Auto-close scheduled at "
                    f"{AUTO_CLOSE_HOUR:02d}:{AUTO_CLOSE_MINUTE:02d} (local time).\n")
-    log.insert(tk.END,
-               f"[INFO] {APP_NAME} v{APP_VERSION} by {APP_AUTHOR} — ready.\n")
+    log.insert(tk.END, f"[INFO] {APP_NAME} v{APP_VERSION} — ready.\n")
+    log_line(f"App started (hidden={start_hidden}, background={BACKGROUND_MODE}, "
+             f"ping_monitor={BACKGROUND_PING_MONITOR}, "
+             f"recovery_scan={AUTO_SCAN_ON_RECOVERY}, "
+             f"launch_scan={RUN_SCAN_ON_LAUNCH}, "
+             f"monitor_interval_s={MONITOR_INTERVAL_SECONDS}, "
+             f"camera_ping={CAMERA_PING_ENABLED}/{CAMERA_PING_INTERVAL_SECONDS}s)")
+
+    # Start NVR monitor
+    UI_STATE["running"] = bool(BACKGROUND_PING_MONITOR)
+    UI_STATE["phase"] = "monitoring" if BACKGROUND_PING_MONITOR else "idle"
+    threading.Thread(target=_monitor_worker, daemon=True).start()
+    log_line("[MONITOR] NVR monitor thread started")
+
+    if CAMERA_PING_ENABLED:
+        threading.Thread(target=_camera_ping_worker, daemon=True).start()
+        log_line("[CAMERA] Camera-ping thread started")
+
+    if BACKGROUND_MODE or START_MINIMIZED_TO_TRAY:
+        start_tray_icon()
+
+    if start_hidden and (BACKGROUND_MODE or START_MINIMIZED_TO_TRAY):
+        try:
+            root.withdraw()
+            log_line("[APP] Window hidden; use tray icon to open.")
+        except Exception:
+            pass
+
+    root.after(500, _apply_running_state)
 
     root.mainloop()
 
 
 # =========================================================
 if __name__ == "__main__":
-    main()
+    _bg_flag = "--background" in sys.argv
+
+    if AUTOSTART_WITH_WINDOWS and not is_autostart_registered():
+        try:
+            register_autostart()
+        except Exception as e:
+            log_line(f"[AUTOSTART] First-run register failed: {e}")
+
+    try:
+        main(start_hidden=_bg_flag)
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        log_line(f"[FATAL] {tb}")
+        try:
+            print(tb)
+            input("\nPress Enter to close...")
+        except Exception:
+            pass

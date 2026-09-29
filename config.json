@@ -1,6 +1,56 @@
 {
     "NVR_LIST": [
         {
+            "url": "http://192.168.110.11/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.110.12/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.12/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.13/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.14/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.16/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.17/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.18/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.19/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
+            "url": "http://192.168.100.21/",
+            "username": "admin",
+            "password": "Javaid786"
+        },
+        {
             "url": "http://192.168.100.22/",
             "username": "admin",
             "password": "Javaid786"
@@ -11,13 +61,13 @@
     "CODRAZE_URL": "https://codraze.vercel.app/",
     "AUTO_START": false,
     "SCAN_DELAY_SECONDS": 2,
-    "COLLECT_ALL_IPS": false,
+    "COLLECT_ALL_IPS": true,
     "ADMIN_PASSWORD_HASH": "cb7970b70bf35bdb224ac9edbd9ff92e4b801c0e99e3e070415f6766529a2e9a",
     "ADMIN_PASSWORD_SALT": "8965e0d03d2768e5b51f80655ae3e488",
     "ADMIN_PASSWORD_SET_AT": "2026-09-23",
     "AUTO_CLOSE_HOUR": 12,
     "AUTO_CLOSE_MINUTE": 0,
-    "AUTO_CLOSE_ENABLED": true,
+    "AUTO_CLOSE_ENABLED": false,
     "TIMEOUT_LOGIN": 120,
     "TIMEOUT_DASHBOARD": 120,
     "TIMEOUT_CONFIG_CLICK": 60,
@@ -29,5 +79,30 @@
     "TIMEOUT_BETWEEN_NVR": 5,
     "STABILITY_BUFFER": 2.0,
     "USE_DATE_STAMPED_FILES": true,
-    "QODIGI_URL": "https://codraze.vercel.app"
+    "OVERLAY_WAIT_TIMEOUT": 8.0,
+    "CLICK_MAX_ATTEMPTS": 3,
+    "BACKGROUND_MODE": true,
+    "START_MINIMIZED_TO_TRAY": true,
+    "MONITOR_INTERVAL_MINUTES": 5,
+    "SHOW_TOASTS": true,
+    "AUTOSTART_WITH_WINDOWS": true,
+    "NVR_DOWN_RETRY_BASE_SECONDS": 30,
+    "NVR_DOWN_RETRY_MAX_SECONDS": 300,
+    "RUN_SCAN_ON_LAUNCH": true,
+    "BACKGROUND_PING_MONITOR": true,
+    "AUTO_SCAN_ON_RECOVERY": true,
+    "NVR_RETRY_ATTEMPTS": 3,
+    "NVR_RETRY_WAIT_SECONDS": [
+        30,
+        60,
+        90
+    ],
+    "ELEMENT_READY_TIMEOUT": 20,
+    "PAGE_READY_TIMEOUT": 15,
+    "MONITOR_INTERVAL_SECONDS": 15,
+    "CAMERA_PING_ENABLED": true,
+    "CAMERA_PING_INTERVAL_SECONDS": 15,
+    "CAMERA_PING_TIMEOUT_SECONDS": 3,
+    "CAMERA_PING_METHOD": "tcp",
+    "CONFIG_VERSION": 2
 }
