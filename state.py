@@ -64,6 +64,10 @@ for _item in config.get("NVR_LIST", []):
 # =========================================================
 # CONFIG-DERIVED CONSTANTS (read at import time)
 # =========================================================
+# Cloud/local-db related (Step 3)
+LOCAL_SITE_ID = ""            # which site this PC belongs to (UUID from local DB)
+LOCAL_SITE_NAME = ""          # human-readable name
+LAST_DB_REPORT_ID = None      # id of the most recent scan_report row
 DOWNLOADS_DIR = config.get("DOWNLOADS_DIR")
 BASE_EXCEL_FILENAME = config.get("EXCEL_FILE", "OfflineCameras.xlsx")
 EXCEL_FILE = os.path.join(DOWNLOADS_DIR, BASE_EXCEL_FILENAME)

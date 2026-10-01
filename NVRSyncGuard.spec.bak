@@ -1,47 +1,95 @@
-# NVRSyncGuard.spec
-# PyInstaller spec for NVR SyncGuard v4.1.1
-# Build:  python -m PyInstaller NVRSyncGuard.spec --clean --noconfirm
+# -*- mode: python ; coding: utf-8 -*-
+"""
+PyInstaller spec for NVR SyncGuard v4.4.0.
+
+Updated for the split-module layout (2026-10). Includes:
+  - images/ and drivers/ as data
+  - all core/, workers/, ui/, tray/ modules as hidden imports
+    (many are imported lazily inside function bodies, so PyInstaller's
+     static analyzer cannot find them)
+  - the standard runtime dependencies (selenium, openpyxl, PIL, pystray)
+"""
+
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
+
+# ---------------------------------------------------------
+# Hidden imports - every module in the split app
+# ---------------------------------------------------------
+hiddenimports = [
+    # foundation
+    "paths", "logger", "config", "state", "auth", "actions",
+
+    # core
+    "core", "core.url_utils", "core.ping", "core.chrome",
+    "core.selenium_helpers", "core.camera_extract", "core.time_sync",
+    "core.camera_scan", "core.nvr_scan", "core.excel", "core.autostart",
+    "core.toasts", "core.relaunch",
+
+    # workers
+    "workers", "workers.nvr_monitor", "workers.camera_monitor",
+    "workers.recovery", "workers.daily_restart", "workers.down_alert",
+
+    # ui
+    "ui", "ui.theme", "ui.widgets", "ui.proxies", "ui.dialogs",
+    "ui.dialogs_forms", "ui.queue_pump", "ui.window",
+
+    # tray
+    "tray", "tray.tray",
+
+    # third-party
+    "selenium", "selenium.webdriver", "selenium.webdriver.common",
+    "selenium.webdriver.chrome", "selenium.webdriver.chrome.service",
+    "selenium.webdriver.chrome.options", "selenium.webdriver.chrome.webdriver",
+    "selenium.webdriver.support", "selenium.webdriver.support.ui",
+    "selenium.webdriver.support.expected_conditions",
+    "selenium.webdriver.common.by", "selenium.webdriver.common.keys",
+    "selenium.common.exceptions",
+    "webdriver_manager", "webdriver_manager.chrome",
+    "openpyxl", "openpyxl.styles",
+    "PIL", "PIL.Image", "PIL.ImageTk", "PIL.ImageDraw",
+    "pystray", "pystray._win32",
+    "winotify", "win10toast",
+]
+
+# Collect every submodule of these packages (safer than guessing)
+for pkg in ("selenium", "webdriver_manager", "openpyxl", "PIL",
+            "pystray", "certifi", "urllib3", "charset_normalizer"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------
+# Data files - bundled read-only resources
+# ---------------------------------------------------------
+datas = [
+    ("images", "images"),
+    ("drivers", "drivers"),
+]
+
+
+# ---------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------
 a = Analysis(
-    ['main.py'],
-    pathex=['C:\\Users\\IT-PC\\NVR-SyncGuard'],
+    ["main.py"],
+    pathex=[],
     binaries=[],
-    datas=[
-        ('images', 'images'),
-    ],
-    hiddenimports=[
-        'selenium',
-        'selenium.webdriver',
-        'selenium.webdriver.common',
-        'selenium.webdriver.chrome',
-        'selenium.webdriver.chrome.service',
-        'selenium.webdriver.chrome.options',
-        'selenium.webdriver.chrome.webdriver',
-        'webdriver_manager',
-        'webdriver_manager.chrome',
-        'openpyxl',
-        'openpyxl.styles',
-        'pystray',
-        'pystray._win32',
-        'PIL',
-        'PIL.Image',
-        'PIL.ImageTk',
-        'PIL.ImageDraw',
-        'winotify',
-        'winreg',
-        'tkinter',
-        'tkinter.ttk',
-        'tkinter.scrolledtext',
-    ],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib', 'numpy', 'scipy', 'pandas',
-        'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
-        'IPython', 'jupyter', 'notebook',
+        # Not needed, saves ~10 MB
+        "matplotlib", "numpy", "pandas", "scipy",
+        "PyQt5", "PyQt6", "PySide2", "PySide6",
+        "IPython", "jupyter", "notebook",
+        "test", "unittest",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -51,6 +99,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+
+# ---------------------------------------------------------
+# EXE - windowed, single file
+# ---------------------------------------------------------
 exe = EXE(
     pyz,
     a.scripts,
@@ -58,18 +110,18 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='NVRSyncGuard',
+    name="NVRSyncGuard",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=False,          # no console window; app runs as GUI
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='images\\logo.ico',
+    icon="images\\logo.ico",
 )

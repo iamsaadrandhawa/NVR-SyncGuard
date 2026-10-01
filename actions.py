@@ -5,11 +5,14 @@ Every command that a button, a menu item, or the tray can trigger lives here:
 adding/removing NVRs, saving settings, changing the report folder, starting
 the scan, exporting the Excel report, restarting, and exiting.
 
-Widgets are now owned by popup dialogs in ui/dialogs_forms.py. Each dialog
+Widgets are owned by popup dialogs in ui/dialogs_forms.py. Each dialog
 assigns its widgets to state.* while it is open, and clears them back to None
-when it closes. The three guards below (add_nvr_from_ui, remove_selected_nvr,
-save_all_settings) check for that None and show a helpful message if the
-relevant dialog is not currently open.
+when it closes. The guards below check for that None and show a helpful
+message if the relevant dialog is not currently open.
+
+Step 3: after every scan, the results are also written to the local SQLite
+database (core/cloud/local_db.py) so that the Server panel can display
+history across sessions.
 """
 
 import os
@@ -80,6 +83,12 @@ def add_nvr_from_ui():
     except Exception:
         pass
 
+    # Also mirror into the local DB (site-scoped)
+    try:
+        _mirror_nvr_to_db(nvr_url, raw_user, raw_pass)
+    except Exception as e:
+        log_line(f"[DB] Could not mirror NVR to local DB: {e}")
+
     state.nvr_entry.set("")
     state.nvr_user_entry.set("")
     state.nvr_pass_entry.set("")
@@ -117,6 +126,12 @@ def remove_selected_nvr():
         state.NVR_PING_HISTORY.pop(removed_host, None)
     except Exception:
         pass
+
+    # Also remove from local DB
+    try:
+        _remove_nvr_from_db(removed_url)
+    except Exception as e:
+        log_line(f"[DB] Could not remove NVR from local DB: {e}")
 
     state.save_config()
     refresh_nvr_count()
@@ -412,6 +427,9 @@ def start_all(log, btn, tree, status_label, auto_start=False):
                                    "[INFO] Scan stopped - saving partial results...\n")
                     save_excel_report(log)
 
+                # ---------- Save to local DB (Step 3) ----------
+                _save_scan_to_local_db(log, scan_t0)
+
                 total_time = _fmt_duration(time.time() - scan_t0)
                 log.insert(tk.END,
                            f"\n[DONE] Scan finished - total time {total_time}\n")
@@ -537,3 +555,147 @@ def full_exit():
         os._exit(0)
     except Exception:
         pass
+
+
+# =========================================================
+# LOCAL DB HELPERS (Step 3)
+# =========================================================
+def _ensure_local_site():
+    """Return the local site id, creating one if needed.
+
+    On first run, the site is named after the PC (hostname). Its id is
+    saved in state.LOCAL_SITE_ID and in config.
+    """
+    try:
+        import socket
+        from core.cloud import local_db
+
+        # Already set in state?
+        sid = getattr(state, "LOCAL_SITE_ID", "") or ""
+        if sid:
+            return sid
+
+        # Check config
+        sid = state.config.get("LOCAL_SITE_ID", "")
+        if sid:
+            state.LOCAL_SITE_ID = sid
+            return sid
+
+        # Check DB - is there exactly one site already?
+        existing = local_db.get_all_sites()
+        if existing:
+            sid = existing[0]["id"]
+            state.LOCAL_SITE_ID = sid
+            state.LOCAL_SITE_NAME = existing[0]["name"]
+            try:
+                state.config["LOCAL_SITE_ID"] = sid
+                state.save_config()
+            except Exception:
+                pass
+            return sid
+
+        # Create a new site named after the PC
+        try:
+            pc_name = socket.gethostname()
+        except Exception:
+            pc_name = "Unknown-PC"
+
+        sid = local_db.insert_site(
+            name=pc_name,
+            location="",
+            pc_name=pc_name,
+        )
+        if sid:
+            state.LOCAL_SITE_ID = sid
+            state.LOCAL_SITE_NAME = pc_name
+            try:
+                state.config["LOCAL_SITE_ID"] = sid
+                state.save_config()
+            except Exception:
+                pass
+        return sid
+    except Exception as e:
+        log_line(f"[DB] _ensure_local_site failed: {e}")
+        return ""
+
+
+def _save_scan_to_local_db(log, scan_started_time):
+    """Persist the just-finished scan to the local SQLite DB.
+
+    Called after every scan (complete or partial). Errors are logged but
+    never propagate to the UI.
+    """
+    try:
+        from datetime import datetime
+        from core.cloud.reports import save_scan_to_db
+
+        site_id = _ensure_local_site()
+        if not site_id:
+            log.insert(tk.END,
+                       "[DB] Could not determine site - scan not saved.\n")
+            return
+
+        started = datetime.fromtimestamp(scan_started_time).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        finished = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        report_id = save_scan_to_db(
+            site_id=site_id,
+            started_at=started,
+            finished_at=finished,
+            total_nvrs=state.total_nvrs_count,
+            total_cameras=state.total_cameras_count,
+            online_cameras=state.online_cameras_count,
+            offline_cameras=state.offline_cameras_count,
+            excel_path=state.last_saved_file or "",
+            camera_rows=list(state.camera_data or []),
+        )
+
+        if report_id:
+            state.LAST_DB_REPORT_ID = report_id
+            log.insert(tk.END,
+                       f"[DB] Scan saved locally (report {report_id[:8]}...)\n")
+        else:
+            log.insert(tk.END, "[DB] Failed to save scan locally.\n")
+    except Exception as e:
+        try:
+            log.insert(tk.END, f"[DB] Local save error: {e}\n")
+        except Exception:
+            pass
+
+
+def _mirror_nvr_to_db(url, username, password):
+    """Insert an NVR into the local DB under the current local site."""
+    try:
+        from core.cloud import local_db
+        site_id = _ensure_local_site()
+        if not site_id:
+            return
+        # Skip if already present
+        existing = local_db.get_nvrs_for_site(site_id)
+        for n in existing:
+            if n["url"] == url:
+                return
+        local_db.insert_nvr(
+            site_id=site_id,
+            url=url,
+            username=username,
+            password_encrypted="",  # encryption comes in a later step
+        )
+    except Exception as e:
+        log_line(f"[DB] _mirror_nvr_to_db failed: {e}")
+
+
+def _remove_nvr_from_db(url):
+    """Delete an NVR from the local DB by URL."""
+    try:
+        from core.cloud import local_db
+        site_id = getattr(state, "LOCAL_SITE_ID", "") or ""
+        if not site_id:
+            return
+        for n in local_db.get_nvrs_for_site(site_id):
+            if n["url"] == url:
+                local_db.delete_nvr(n["id"])
+                return
+    except Exception as e:
+        log_line(f"[DB] _remove_nvr_from_db failed: {e}")

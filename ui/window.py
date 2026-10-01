@@ -3,12 +3,12 @@ Main window construction - top nav bar version.
 
 Layout:
     [header: logo, title, clock, codraze button]
-    [top nav bar: + Add NVR | ⚙ Configure NVR | 🔧 Settings | 📁 Reports | ℹ About]
-    [full-width dashboard: action bar, stat cards, camera table, logs]
+    [top nav bar: + Add NVR | ⚙ Configure NVR | 🔧 Settings | 📁 Reports | 🖥 Server | ℹ About]
+    [body: optional left Server panel | dashboard fills the rest]
     [footer]
 
-Each nav button opens a non-modal Toplevel dialog from ui.dialogs_forms.
-The old left panel is gone, so the dashboard fills the whole width.
+Nav buttons open non-modal dialogs from ui.dialogs_forms, EXCEPT the
+Server button, which toggles an inline panel on the left side.
 """
 
 import os
@@ -196,6 +196,10 @@ def main(start_hidden=False):
         from ui.dialogs_forms import open_about_dialog
         open_about_dialog()
 
+    # Server is a TOGGLE for an inline panel, not a dialog opener
+    def _toggle_server_panel():
+        _do_toggle_server_panel()
+
     nav_specs = [
         ("+  Add NVR", _open_add_nvr,
          COLORS["blue"], COLORS["blue_dark"], "#1e40af"),
@@ -205,6 +209,8 @@ def main(start_hidden=False):
          "#eff6ff", "#dbeafe", "#bfdbfe"),
         ("\U0001f4c1  Reports", _open_reports,
          "#eff6ff", "#dbeafe", "#bfdbfe"),
+        ("\U0001f5a5  Server", _toggle_server_panel,
+         COLORS["blue"], COLORS["blue_dark"], "#1e40af"),
         ("\u2139  About", _open_about,
          "#eff6ff", "#dbeafe", "#bfdbfe"),
     ]
@@ -214,18 +220,54 @@ def main(start_hidden=False):
         RoundedButton(nav_inner, text=text, command=cmd,
                       radius=8, bg=bg, fg=fg,
                       hover_bg=hover, active_bg=active,
-                      width=175, height=44,
+                      width=165, height=44,
                       font=("Segoe UI", 10, "bold")
                       ).pack(side=tk.LEFT, padx=(0, 8))
 
-    # ---------- BODY (full width, no left panel) ----------
+    # ---------- BODY (grid with optional left panel) ----------
     body = tk.Frame(outer, bg=COLORS["bg"])
     body.pack(fill=tk.BOTH, expand=True)
-    body.grid_columnconfigure(0, weight=1)
     body.grid_rowconfigure(0, weight=1)
+    body.grid_columnconfigure(0, weight=0)   # left panel column (hidden by default)
+    body.grid_columnconfigure(1, weight=1)   # dashboard column
 
+    # Left panel holder - initially hidden (grid_remove)
+    server_panel_holder = tk.Frame(body, bg=COLORS["bg"], width=360)
+    server_panel_holder.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+    server_panel_holder.grid_propagate(False)
+    server_panel_holder.grid_remove()
+
+    server_panel_state = {"visible": False, "widget": None}
+
+    def _show_server_panel():
+        if server_panel_state["visible"]:
+            return
+        if server_panel_state["widget"] is None:
+            from ui.server_panel import build_server_panel
+            widget = build_server_panel(
+                server_panel_holder,
+                on_close=_hide_server_panel,
+            )
+            widget.pack(fill=tk.BOTH, expand=True)
+            server_panel_state["widget"] = widget
+        server_panel_holder.grid()
+        server_panel_state["visible"] = True
+
+    def _hide_server_panel():
+        if not server_panel_state["visible"]:
+            return
+        server_panel_holder.grid_remove()
+        server_panel_state["visible"] = False
+
+    def _do_toggle_server_panel():
+        if server_panel_state["visible"]:
+            _hide_server_panel()
+        else:
+            _show_server_panel()
+
+    # Dashboard (right side, always visible)
     right = tk.Frame(body, bg=COLORS["bg"])
-    right.grid(row=0, column=0, sticky="nsew")
+    right.grid(row=0, column=1, sticky="nsew")
     right.grid_columnconfigure(0, weight=1)
     right.grid_rowconfigure(3, weight=3)
     right.grid_rowconfigure(4, weight=2)

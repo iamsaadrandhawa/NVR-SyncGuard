@@ -1,12 +1,9 @@
 """
 Popup form dialogs for the top nav bar.
 
-Each function opens a non-modal Toplevel window that contains a self-contained
-form. While a dialog is open, its widgets are assigned to state.* so that
+Each function opens a non-modal Toplevel window with a self-contained form.
+While a dialog is open, its widgets are assigned to state.* so that
 actions.py finds them the same way it did when they lived in the left panel.
-
-On close, the state.* references are cleared (set back to None) so nothing
-tries to use a destroyed widget.
 
 Exposed:
     open_add_nvr_dialog()
@@ -14,6 +11,7 @@ Exposed:
     open_settings_dialog()
     open_reports_dialog()
     open_about_dialog()
+    open_add_site_dialog(on_saved=None)
     close_all_dialogs()
 """
 
@@ -27,6 +25,9 @@ from ui.widgets import RoundedFrame, RoundedButton, RoundedEntry
 _OPEN = {}
 
 
+# =========================================================
+# SHARED HELPERS
+# =========================================================
 def _center(dlg, parent, w, h):
     dlg.update_idletasks()
     try:
@@ -54,7 +55,7 @@ def _bring_to_front(dlg):
         pass
 
 
-def _new_dialog(key, title, parent, width, height):
+def _new_dialog(key, title, parent, width, height, resizable=False):
     existing = _OPEN.get(key)
     if existing is not None:
         try:
@@ -67,8 +68,9 @@ def _new_dialog(key, title, parent, width, height):
     dlg = tk.Toplevel(parent) if parent else tk.Toplevel()
     dlg.title(title)
     dlg.configure(bg=COLORS["card"])
-    dlg.resizable(False, False)
+    dlg.resizable(resizable, resizable)
     dlg.transient(parent)
+    dlg.minsize(320, 240)
 
     _OPEN[key] = dlg
     _center(dlg, parent, width, height)
@@ -255,7 +257,8 @@ def open_configure_nvr_dialog():
 # =========================================================
 def open_settings_dialog():
     parent = state.root
-    dlg = _new_dialog("settings", "Settings", parent, 460, 620)
+    dlg = _new_dialog("settings", "Settings", parent, 460, 620,
+                      resizable=True)
     if dlg is None:
         return
 
@@ -495,11 +498,11 @@ def open_reports_dialog():
 
 
 # =========================================================
-# ABOUT DIALOG
+# ABOUT DIALOG (with single Update button)
 # =========================================================
 def open_about_dialog():
     parent = state.root
-    dlg = _new_dialog("about", "About NVR SyncGuard", parent, 420, 320)
+    dlg = _new_dialog("about", "About NVR SyncGuard", parent, 440, 400)
     if dlg is None:
         return
 
@@ -509,7 +512,7 @@ def open_about_dialog():
     dlg.protocol("WM_DELETE_WINDOW", close)
 
     body = tk.Frame(dlg, bg=COLORS["card"])
-    body.pack(fill=tk.BOTH, expand=True, padx=22, pady=20)
+    body.pack(fill=tk.BOTH, expand=True, padx=24, pady=22)
 
     tk.Label(body, text=state.APP_NAME, bg=COLORS["card"], fg=COLORS["ink"],
              font=("Segoe UI", 16, "bold")).pack(anchor="w")
@@ -524,15 +527,366 @@ def open_about_dialog():
              text="Automated NVR time synchronization\n"
                   "and camera health monitoring.",
              bg=COLORS["card"], fg=COLORS["ink"],
-             font=("Segoe UI", 10), justify="left").pack(anchor="w", pady=(0, 20))
+             font=("Segoe UI", 10), justify="left").pack(anchor="w", pady=(0, 16))
+
+    # ---------- UPDATE SECTION ----------
+    tk.Frame(body, bg=COLORS["line"], height=1).pack(fill=tk.X, pady=(0, 14))
+
+    tk.Label(body, text="APPLY CHANGES",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 6))
+
+    tk.Label(body,
+             text="Restart the app to reload code changes.\n"
+                  "Useful after editing source files.",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(0, 12))
+
+    def do_update():
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Update & Restart",
+            "Restart now to apply changes?\n\n"
+            "The current window will close and the app will relaunch.",
+            parent=dlg,
+        ):
+            return
+        try:
+            _on_dialog_close("about")
+        except Exception:
+            pass
+        try:
+            from actions import restart_app
+            restart_app()
+        except Exception as e:
+            from logger import log_line
+            log_line(f"[ABOUT] Restart failed: {e}")
+
+    RoundedButton(body, text="\u21bb  Update",
+                  command=do_update,
+                  bg=COLORS["blue"], fg="#ffffff",
+                  hover_bg=COLORS["blue_dark"], active_bg="#1e40af",
+                  width=200, height=42,
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+
+    # ---------- BOTTOM ----------
+    tk.Frame(body, bg=COLORS["line"], height=1).pack(fill=tk.X, pady=(16, 14))
+
+    bottom_row = tk.Frame(body, bg=COLORS["card"])
+    bottom_row.pack(fill=tk.X)
 
     def do_open_site():
         from actions import open_company_website
         open_company_website()
 
-    RoundedButton(body, text=f"{state.APP_AUTHOR.upper()}  \u2197",
+    RoundedButton(bottom_row, text=f"{state.APP_AUTHOR.upper()}  \u2197",
                   command=do_open_site,
+                  bg="#eff6ff", fg="#1d4ed8",
+                  hover_bg="#dbeafe", active_bg="#bfdbfe",
+                  width=180, height=40,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+    RoundedButton(bottom_row, text="Close",
+                  command=close,
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=120, height=40,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.RIGHT)
+
+
+# =========================================================
+# ADD SITE DIALOG (Step 3)
+# =========================================================
+def open_add_site_dialog(on_saved=None):
+    """Add a new site to the local DB.
+
+    on_saved - optional callback invoked after a successful save (used
+               by the Server panel to refresh its list).
+    """
+    parent = state.root
+    dlg = _new_dialog("add_site", "Add Site", parent, 440, 400)
+    if dlg is None:
+        return
+
+    def close():
+        _on_dialog_close("add_site")
+
+    dlg.protocol("WM_DELETE_WINDOW", close)
+
+    body = tk.Frame(dlg, bg=COLORS["card"])
+    body.pack(fill=tk.BOTH, expand=True, padx=22, pady=20)
+
+    tk.Label(body, text="ADD SITE", bg=COLORS["card"], fg=COLORS["ink"],
+             font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    tk.Label(body, text="Create a new site to group NVRs and reports.",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 14))
+
+    tk.Label(body, text="SITE NAME",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 5))
+    name_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    name_entry.pack(fill=tk.X)
+
+    tk.Label(body, text="LOCATION (optional)",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
+    loc_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    loc_entry.pack(fill=tk.X)
+
+    try:
+        import socket
+        default_pc = socket.gethostname()
+    except Exception:
+        default_pc = ""
+
+    tk.Label(body, text="PC NAME",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
+    pc_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    pc_entry.pack(fill=tk.X)
+    pc_entry.set(default_pc)
+
+    actions_row = tk.Frame(body, bg=COLORS["card"])
+    actions_row.pack(fill=tk.X, pady=(18, 0))
+
+    def do_save():
+        from tkinter import messagebox
+        from core.cloud import local_db
+
+        name = name_entry.get().strip()
+        loc = loc_entry.get().strip()
+        pc = pc_entry.get().strip()
+
+        if not name:
+            messagebox.showwarning("Missing name",
+                                   "Enter a site name.", parent=dlg)
+            return
+
+        existing = local_db.get_all_sites()
+        for s in existing:
+            if s["name"].lower() == name.lower():
+                messagebox.showinfo("Already exists",
+                                    f"A site named '{name}' already exists.",
+                                    parent=dlg)
+                return
+
+        sid = local_db.insert_site(name=name, location=loc, pc_name=pc)
+        if not sid:
+            messagebox.showerror("Save failed",
+                                 "Could not save the site. See logs.",
+                                 parent=dlg)
+            return
+
+        messagebox.showinfo("Site added",
+                            f"Site '{name}' has been created.",
+                            parent=dlg)
+        if callable(on_saved):
+            try:
+                on_saved()
+            except Exception:
+                pass
+        close()
+
+    def do_cancel():
+        close()
+
+    RoundedButton(actions_row, text="Save Site", command=do_save,
                   bg=COLORS["blue"], fg="#ffffff",
                   hover_bg=COLORS["blue_dark"], active_bg="#1e40af",
-                  width=200, height=40,
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+                  width=160, height=42,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+    RoundedButton(actions_row, text="Cancel", command=do_cancel,
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=120, height=42,
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(8, 0))
+
+                  # =========================================================
+# =========================================================
+# RENAME SITE DIALOG (Step 3)
+# =========================================================
+def open_rename_site_dialog(site_id, on_saved=None):
+    """Rename a site and change its location."""
+    parent = state.root
+    dlg = _new_dialog("rename_site", "Rename Site", parent, 440, 340)
+    if dlg is None:
+        return
+
+    from core.cloud import local_db
+    site = local_db.get_site(site_id)
+    if not site:
+        return
+
+    def close():
+        _on_dialog_close("rename_site")
+
+    dlg.protocol("WM_DELETE_WINDOW", close)
+
+    body = tk.Frame(dlg, bg=COLORS["card"])
+    body.pack(fill=tk.BOTH, expand=True, padx=22, pady=20)
+
+    tk.Label(body, text="RENAME SITE", bg=COLORS["card"], fg=COLORS["ink"],
+             font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    tk.Label(body, text="Update the site name or location.",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 14))
+
+    tk.Label(body, text="SITE NAME",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 5))
+    name_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    name_entry.pack(fill=tk.X)
+    name_entry.set(site["name"])
+
+    tk.Label(body, text="LOCATION (optional)",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
+    loc_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    loc_entry.pack(fill=tk.X)
+    loc_entry.set(site.get("location", ""))
+
+    actions_row = tk.Frame(body, bg=COLORS["card"])
+    actions_row.pack(fill=tk.X, pady=(18, 0))
+
+    def do_save():
+        from tkinter import messagebox
+
+        new_name = name_entry.get().strip()
+        new_loc = loc_entry.get().strip()
+
+        if not new_name:
+            messagebox.showwarning("Missing name",
+                                   "Enter a site name.", parent=dlg)
+            return
+
+        # Check for duplicates (excluding self)
+        for s in local_db.get_all_sites():
+            if s["id"] == site_id:
+                continue
+            if s["name"].lower() == new_name.lower():
+                messagebox.showinfo("Already exists",
+                                    f"A site named '{new_name}' already exists.",
+                                    parent=dlg)
+                return
+
+        ok = local_db.update_site(site_id, name=new_name, location=new_loc)
+        if not ok:
+            messagebox.showerror("Save failed",
+                                 "Could not update the site. See logs.",
+                                 parent=dlg)
+            return
+
+        messagebox.showinfo("Updated",
+                            "Site has been updated.",
+                            parent=dlg)
+        if callable(on_saved):
+            try:
+                on_saved()
+            except Exception:
+                pass
+        close()
+
+    RoundedButton(actions_row, text="Save", command=do_save,
+                  bg=COLORS["blue"], fg="#ffffff",
+                  hover_bg=COLORS["blue_dark"], active_bg="#1e40af",
+                  width=140, height=42,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+    RoundedButton(actions_row, text="Cancel", command=close,
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=120, height=42,
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(8, 0))
+    """Rename a site and change its location."""
+    parent = state.root
+    dlg = _new_dialog("rename_site", "Rename Site", parent, 440, 340)
+    if dlg is None:
+        return
+
+    from core.cloud import local_db
+    site = local_db.get_site(site_id)
+    if not site:
+        return
+
+    def close():
+        _on_dialog_close("rename_site")
+
+    dlg.protocol("WM_DELETE_WINDOW", close)
+
+    body = tk.Frame(dlg, bg=COLORS["card"])
+    body.pack(fill=tk.BOTH, expand=True, padx=22, pady=20)
+
+    tk.Label(body, text="RENAME SITE", bg=COLORS["card"], fg=COLORS["ink"],
+             font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    tk.Label(body, text="Update the site name or location.",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 14))
+
+    tk.Label(body, text="SITE NAME",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 5))
+    name_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    name_entry.pack(fill=tk.X)
+    name_entry.set(site["name"])
+
+    tk.Label(body, text="LOCATION (optional)",
+             bg=COLORS["card"], fg=COLORS["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 5))
+    loc_entry = RoundedEntry(body, radius=10, width=340, height=42)
+    loc_entry.pack(fill=tk.X)
+    loc_entry.set(site.get("location", ""))
+
+    actions_row = tk.Frame(body, bg=COLORS["card"])
+    actions_row.pack(fill=tk.X, pady=(18, 0))
+
+    def do_save():
+        from tkinter import messagebox
+
+        new_name = name_entry.get().strip()
+        new_loc = loc_entry.get().strip()
+
+        if not new_name:
+            messagebox.showwarning("Missing name",
+                                   "Enter a site name.", parent=dlg)
+            return
+
+        # Check for duplicates (excluding self)
+        for s in local_db.get_all_sites():
+            if s["id"] == site_id:
+                continue
+            if s["name"].lower() == new_name.lower():
+                messagebox.showinfo("Already exists",
+                                    f"A site named '{new_name}' already exists.",
+                                    parent=dlg)
+                return
+
+        ok = local_db.update_site(site_id, name=new_name, location=new_loc)
+        if not ok:
+            messagebox.showerror("Save failed",
+                                 "Could not update the site. See logs.",
+                                 parent=dlg)
+            return
+
+        messagebox.showinfo("Updated",
+                            "Site has been updated.",
+                            parent=dlg)
+        if callable(on_saved):
+            try:
+                on_saved()
+            except Exception:
+                pass
+        close()
+
+    RoundedButton(actions_row, text="Save", command=do_save,
+                  bg=COLORS["blue"], fg="#ffffff",
+                  hover_bg=COLORS["blue_dark"], active_bg="#1e40af",
+                  width=140, height=42,
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+    RoundedButton(actions_row, text="Cancel", command=close,
+                  bg="#f1f5f9", fg=COLORS["ink"],
+                  hover_bg="#e2e8f0", active_bg="#cbd5e1",
+                  width=120, height=42,
+                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(8, 0))
